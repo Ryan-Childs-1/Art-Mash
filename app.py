@@ -1,23 +1,25 @@
 # app.py
 # Art Mash — historical art FaceMash using Gallerix (no server-side image downloading)
 #
-# FIXES:
-# - Images are displayed client-side using either:
-#   (A) iframe embedding the painting page (most reliable)
-#   (B) HTML <img src="..."> (browser fetch, not server fetch)
+# FIXES (critical):
+# - Robust SQLite schema migrations (handles old DBs on Streamlit Cloud)
+# - DB path auto-resolves to writable location (/tmp) when needed
+# - Safe retry on queries after migration
+#
+# DISPLAY (no downloading art):
+# - iframe embedding painting page (most reliable)
+# - or browser-side <img src="..."> (fast; may fail if CDN blocks)
 #
 # FEATURES:
-# - TrueSkill-lite ratings: mu/sigma with uncertainty-based matchmaking
+# - TrueSkill-lite ratings (mu/sigma) with uncertainty-based matchmaking
 # - Tournament mode (single elimination bracket)
 # - Hot/New feeds
-# - Artist-level rankings
-# - Style clustering (heuristic tags)
+# - Artist-level rankings + style clustering (heuristic tags)
 #
 # Dependencies: streamlit only (stdlib otherwise)
 
 import os
 import re
-import io
 import time
 import json
 import math
@@ -41,9 +43,8 @@ APP_NAME = "Art Mash"
 BASE = "https://gallerix.org"
 SEED_PAGE = "https://gallerix.org/a1/"  # popular albums list
 
-DEFAULT_UA = "ArtMash/2.0 (Streamlit; respectful crawler)"
+DEFAULT_UA = "ArtMash/2.1 (Streamlit; respectful crawler)"
 CACHE_DIR = ".cache_artmash"
-DB_PATH = "artmash.sqlite3"
 
 # TrueSkill-lite defaults (similar spirit to TrueSkill)
 TS_MU0 = 25.0
@@ -66,6 +67,117 @@ STYLE_KEYWORDS = {
     "Abstract": ["abstract", "abstraction"],
     "Neoclassicism": ["neoclassic", "neoclassicism"],
 }
+
+
+# ----------------------------
+# DB path + migrations (CRITICAL FIX)
+# ----------------------------
+def resolve_db_path(default_name: str = "artmash.sqlite3") -> str:
+    """
+    Streamlit Cloud sometimes has repo paths that behave oddly with write permissions.
+    Prefer a writable location. /tmp is always writable in Streamlit Cloud containers.
+    You can override via env ART MASH_DB_PATH.
+    """
+    env = os.getenv("ARTMASH_DB_PATH")
+    if env:
+        return env
+
+    # If current directory is writable, keep it local (nice for dev).
+    try:
+        test_path = os.path.join(os.getcwd(), ".write_test")
+        with open(test_path, "w") as f:
+            f.write("ok")
+        os.remove(test_path)
+        return default_name
+    except Exception:
+        return os.path.join("/tmp", default_name)
+
+
+DB_PATH = resolve_db_path()
+
+
+def table_columns(conn: sqlite3.Connection, table: str) -> set:
+    cur = conn.execute(f"PRAGMA table_info({table})")
+    return {row[1] for row in cur.fetchall()}  # row[1] is column name
+
+
+def ensure_column(conn: sqlite3.Connection, table: str, col: str, decl: str):
+    cols = table_columns(conn, table)
+    if col in cols:
+        return
+    conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+
+
+def migrate_schema(conn: sqlite3.Connection):
+    """
+    Idempotent migrations:
+    - Creates base tables if missing
+    - Adds new columns if missing
+    - Backfills defaults for existing rows
+    """
+    # Base tables (minimal safe schema)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS paintings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            url TEXT UNIQUE,
+            img_url TEXT,
+            title TEXT,
+            artist TEXT,
+            meta TEXT,
+            elo REAL DEFAULT 1500.0,
+            games INTEGER DEFAULT 0,
+            wins INTEGER DEFAULT 0,
+            losses INTEGER DEFAULT 0,
+            last_seen INTEGER DEFAULT 0
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS votes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts INTEGER,
+            left_url TEXT,
+            right_url TEXT,
+            winner_url TEXT,
+            mode TEXT
+        )
+        """
+    )
+
+    # Add newer columns safely
+    ensure_column(conn, "paintings", "mu", "REAL DEFAULT 25.0")
+    ensure_column(conn, "paintings", "sigma", "REAL DEFAULT 8.333")
+    ensure_column(conn, "paintings", "tags", "TEXT")
+    ensure_column(conn, "paintings", "last_vote", "INTEGER DEFAULT 0")
+
+    # Some older DBs may have votes table without mode
+    try:
+        ensure_column(conn, "votes", "mode", "TEXT")
+    except Exception:
+        pass
+
+    # Backfill defaults for existing rows where fields are NULL
+    conn.execute("UPDATE paintings SET mu=25.0 WHERE mu IS NULL")
+    conn.execute("UPDATE paintings SET sigma=8.333 WHERE sigma IS NULL")
+    conn.execute("UPDATE paintings SET last_vote=0 WHERE last_vote IS NULL")
+
+    conn.commit()
+
+
+def db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    return conn
+
+
+def init_db():
+    conn = db()
+    try:
+        migrate_schema(conn)
+    finally:
+        conn.close()
 
 
 # ----------------------------
@@ -257,7 +369,6 @@ def extract_paintings_from_album(html: str, album_url: str) -> List[str]:
 
 def extract_title_artist_meta_and_text(html: str) -> Tuple[str, str, str, str]:
     title, artist, meta = "", "", ""
-    # quick title
     m = re.search(r"(?is)<h1[^>]*>(.*?)</h1>", html)
     if m:
         h1 = re.sub(r"(?is)<.*?>", " ", m.group(1))
@@ -268,12 +379,10 @@ def extract_title_artist_meta_and_text(html: str) -> Tuple[str, str, str, str]:
         artist = re.sub(r"(?is)<.*?>", " ", m.group(1))
         artist = re.sub(r"\s+", " ", artist).strip()
 
-    # year/size line e.g. "1889. 73.0 x 92.0 cm."
     m = re.search(r"(?m)^\s*(\d{3,4}\.\s*[^<]{0,140}cm\.)\s*$", html)
     if m:
         meta = m.group(1).strip()
 
-    # strip text for style heuristics
     raw_text = re.sub(r"(?is)<script.*?</script>", " ", html)
     raw_text = re.sub(r"(?is)<style.*?</style>", " ", raw_text)
     raw_text = re.sub(r"(?is)<.*?>", " ", raw_text)
@@ -309,92 +418,97 @@ def infer_style_tags(text: str) -> List[str]:
 # ----------------------------
 # SQLite storage
 # ----------------------------
-def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    return conn
-
-
-def init_db():
-    c = db()
-    c.execute(
-        """
-        CREATE TABLE IF NOT EXISTS paintings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            url TEXT UNIQUE,
-            img_url TEXT,
-            title TEXT,
-            artist TEXT,
-            meta TEXT,
-            tags TEXT,
-            -- legacy Elo:
-            elo REAL DEFAULT 1500.0,
-            -- TrueSkill-lite:
-            mu REAL DEFAULT 25.0,
-            sigma REAL DEFAULT 8.333,
-            games INTEGER DEFAULT 0,
-            wins INTEGER DEFAULT 0,
-            losses INTEGER DEFAULT 0,
-            last_seen INTEGER DEFAULT 0,
-            last_vote INTEGER DEFAULT 0
-        )
-        """
-    )
-    c.execute(
-        """
-        CREATE TABLE IF NOT EXISTS votes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts INTEGER,
-            left_url TEXT,
-            right_url TEXT,
-            winner_url TEXT,
-            mode TEXT
-        )
-        """
-    )
-    c.commit()
-    c.close()
-
-
 def upsert_painting(url: str, img_url: str, title: str, artist: str, meta: str, tags: List[str]):
-    c = db()
-    c.execute(
-        """
-        INSERT INTO paintings (url, img_url, title, artist, meta, tags, elo, mu, sigma, last_seen)
-        VALUES (?, ?, ?, ?, ?, ?, 1500.0, ?, ?, ?)
-        ON CONFLICT(url) DO UPDATE SET
-            img_url=excluded.img_url,
-            title=COALESCE(excluded.title, paintings.title),
-            artist=COALESCE(excluded.artist, paintings.artist),
-            meta=COALESCE(excluded.meta, paintings.meta),
-            tags=COALESCE(excluded.tags, paintings.tags),
-            last_seen=excluded.last_seen
-        """,
-        (url, img_url, title, artist, meta, json.dumps(tags), TS_MU0, TS_SIGMA0, now_ts()),
+    conn = db()
+    try:
+        migrate_schema(conn)
+        conn.execute(
+            """
+            INSERT INTO paintings (url, img_url, title, artist, meta, tags, elo, mu, sigma, last_seen, last_vote)
+            VALUES (?, ?, ?, ?, ?, ?, 1500.0, ?, ?, ?, 0)
+            ON CONFLICT(url) DO UPDATE SET
+                img_url=excluded.img_url,
+                title=COALESCE(excluded.title, paintings.title),
+                artist=COALESCE(excluded.artist, paintings.artist),
+                meta=COALESCE(excluded.meta, paintings.meta),
+                tags=COALESCE(excluded.tags, paintings.tags),
+                last_seen=excluded.last_seen
+            """,
+            (url, img_url, title, artist, meta, json.dumps(tags), TS_MU0, TS_SIGMA0, now_ts()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_painting(url: str) -> Optional[Dict]:
+    conn = db()
+    try:
+        migrate_schema(conn)
+        cur = conn.execute(
+            """
+            SELECT url, img_url, title, artist, meta, tags, elo, mu, sigma, games, wins, losses, last_seen, last_vote
+            FROM paintings WHERE url=?
+            """,
+            (url,),
+        )
+        r = cur.fetchone()
+    finally:
+        conn.close()
+
+    if not r:
+        return None
+    return dict(
+        url=r[0],
+        img_url=r[1] or "",
+        title=r[2] or "",
+        artist=r[3] or "",
+        meta=r[4] or "",
+        tags=json.loads(r[5]) if r[5] else [],
+        elo=float(r[6] or 1500.0),
+        mu=float(r[7] or TS_MU0),
+        sigma=float(r[8] or TS_SIGMA0),
+        games=int(r[9] or 0),
+        wins=int(r[10] or 0),
+        losses=int(r[11] or 0),
+        last_seen=int(r[12] or 0),
+        last_vote=int(r[13] or 0),
     )
-    c.commit()
-    c.close()
 
 
 def get_pool(limit: int = 2000) -> List[Dict]:
-    c = db()
-    cur = c.execute(
-        """
-        SELECT url, img_url, title, artist, meta, tags, elo, mu, sigma, games, wins, losses, last_seen, last_vote
-        FROM paintings
-        ORDER BY last_seen DESC
-        LIMIT ?
-        """,
-        (limit,),
-    )
-    rows = cur.fetchall()
-    c.close()
+    """
+    Safe select:
+    - If schema is old, migrate + retry.
+    """
+    def _run(conn):
+        cur = conn.execute(
+            """
+            SELECT url, img_url, title, artist, meta, tags, elo, mu, sigma, games, wins, losses, last_seen, last_vote
+            FROM paintings
+            ORDER BY last_seen DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        return cur.fetchall()
+
+    conn = db()
+    try:
+        try:
+            rows = _run(conn)
+        except sqlite3.OperationalError:
+            migrate_schema(conn)
+            rows = _run(conn)
+    finally:
+        conn.close()
+
     out = []
     for r in rows:
         out.append(
             dict(
                 url=r[0],
-                img_url=r[1],
+                img_url=r[1] or "",
                 title=r[2] or "",
                 artist=r[3] or "",
                 meta=r[4] or "",
@@ -412,45 +526,17 @@ def get_pool(limit: int = 2000) -> List[Dict]:
     return out
 
 
-def get_painting(url: str) -> Optional[Dict]:
-    c = db()
-    cur = c.execute(
-        """
-        SELECT url, img_url, title, artist, meta, tags, elo, mu, sigma, games, wins, losses, last_seen, last_vote
-        FROM paintings WHERE url=?
-        """,
-        (url,),
-    )
-    r = cur.fetchone()
-    c.close()
-    if not r:
-        return None
-    return dict(
-        url=r[0],
-        img_url=r[1],
-        title=r[2] or "",
-        artist=r[3] or "",
-        meta=r[4] or "",
-        tags=json.loads(r[5]) if r[5] else [],
-        elo=float(r[6] or 1500.0),
-        mu=float(r[7] or TS_MU0),
-        sigma=float(r[8] or TS_SIGMA0),
-        games=int(r[9] or 0),
-        wins=int(r[10] or 0),
-        losses=int(r[11] or 0),
-        last_seen=int(r[12] or 0),
-        last_vote=int(r[13] or 0),
-    )
-
-
 def record_vote(left_url: str, right_url: str, winner_url: str, mode: str):
-    c = db()
-    c.execute(
-        "INSERT INTO votes (ts, left_url, right_url, winner_url, mode) VALUES (?, ?, ?, ?, ?)",
-        (now_ts(), left_url, right_url, winner_url, mode),
-    )
-    c.commit()
-    c.close()
+    conn = db()
+    try:
+        migrate_schema(conn)
+        conn.execute(
+            "INSERT INTO votes (ts, left_url, right_url, winner_url, mode) VALUES (?, ?, ?, ?, ?)",
+            (now_ts(), left_url, right_url, winner_url, mode),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 # ----------------------------
@@ -461,7 +547,6 @@ def normal_pdf(x: float) -> float:
 
 
 def normal_cdf(x: float) -> float:
-    # Abramowitz & Stegun approximation via erf
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 
@@ -472,12 +557,6 @@ def trueskill_lite_update(
     beta: float = TS_BETA,
     tau: float = TS_TAU,
 ) -> Tuple[Tuple[float, float], Tuple[float, float]]:
-    """
-    Two-player TrueSkill-like update (no draws):
-    - Inflate sigmas slightly by tau (dynamics)
-    - Compute performance difference distribution
-    - Update mu and sigma using v,w factors
-    """
     # dynamics
     sig_a = math.sqrt(sig_a * sig_a + tau * tau)
     sig_b = math.sqrt(sig_b * sig_b + tau * tau)
@@ -485,21 +564,17 @@ def trueskill_lite_update(
     c2 = 2 * beta * beta + sig_a * sig_a + sig_b * sig_b
     c = math.sqrt(c2) + 1e-12
 
-    # if A wins: t = (mu_a - mu_b)/c ; else flipped sign
     t = (mu_a - mu_b) / c
     if not a_wins:
         t = -t
 
-    # v, w
     Phi = normal_cdf(t)
     phi = normal_pdf(t)
     v = phi / max(Phi, 1e-12)
     w = v * (v + t)
 
-    # update
-    rank_mult = 1.0  # no draws/tiers
-    delta_mu_a = (sig_a * sig_a / c) * v * rank_mult
-    delta_mu_b = (sig_b * sig_b / c) * v * rank_mult
+    delta_mu_a = (sig_a * sig_a / c) * v
+    delta_mu_b = (sig_b * sig_b / c) * v
 
     if a_wins:
         mu_a_new = mu_a + delta_mu_a
@@ -537,13 +612,10 @@ def k_factor(games: int) -> float:
 
 
 def mu_sigma_to_value(mu: float, sigma: float) -> float:
-    # conservative "skill" value like TrueSkill: mu - 3*sigma
     return mu - 3.0 * sigma
 
 
 def value_score_0_100(v: float) -> float:
-    # Map a typical TrueSkill conservative range into 0..100
-    # v ~ [0..40] generally, so scale to 0..100
     return clamp((v / 40.0) * 100.0, 0.0, 100.0)
 
 
@@ -553,42 +625,43 @@ def apply_vote(winner_url: str, loser_url: str, mode: str = "vote"):
     if not w or not l:
         return
 
-    # Update Elo for backwards-compat + simple leaderboard
     rw, rl = w["elo"], l["elo"]
     k = (k_factor(w["games"]) + k_factor(l["games"])) / 2.0
     new_rw, new_rl = elo_update(rw, rl, score_a=1.0, k=k)
 
-    # Update TrueSkill-lite
     (mu_w, sig_w), (mu_l, sig_l) = trueskill_lite_update(
         w["mu"], w["sigma"], l["mu"], l["sigma"], a_wins=True
     )
 
-    c = db()
-    c.execute(
-        """
-        UPDATE paintings
-        SET elo=?, mu=?, sigma=?, games=games+1, wins=wins+1, last_vote=?
-        WHERE url=?
-        """,
-        (new_rw, mu_w, sig_w, now_ts(), winner_url),
-    )
-    c.execute(
-        """
-        UPDATE paintings
-        SET elo=?, mu=?, sigma=?, games=games+1, losses=losses+1, last_vote=?
-        WHERE url=?
-        """,
-        (new_rl, mu_l, sig_l, now_ts(), loser_url),
-    )
-    c.commit()
-    c.close()
+    conn = db()
+    try:
+        migrate_schema(conn)
+        conn.execute(
+            """
+            UPDATE paintings
+            SET elo=?, mu=?, sigma=?, games=games+1, wins=wins+1, last_vote=?
+            WHERE url=?
+            """,
+            (new_rw, mu_w, sig_w, now_ts(), winner_url),
+        )
+        conn.execute(
+            """
+            UPDATE paintings
+            SET elo=?, mu=?, sigma=?, games=games+1, losses=losses+1, last_vote=?
+            WHERE url=?
+            """,
+            (new_rl, mu_l, sig_l, now_ts(), loser_url),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 # ----------------------------
 # Crawling pipeline (HTML only)
 # ----------------------------
 def crawl_seed_albums(user_agent: str, timeout: float, delay: float, max_albums: int) -> List[str]:
-    html, fr = fetch_text(SEED_PAGE, user_agent=user_agent, timeout=timeout, max_bytes=2_000_000)
+    html, _ = fetch_text(SEED_PAGE, user_agent=user_agent, timeout=timeout, max_bytes=2_000_000)
     if not html:
         return []
     albums = pick_seed_albums_from_a1(html)[:max_albums]
@@ -604,7 +677,7 @@ def crawl_album_for_paintings(
     delay: float,
     max_paintings_per_album: int,
 ) -> List[str]:
-    html, fr = fetch_text(album_url, user_agent=user_agent, timeout=timeout, max_bytes=3_000_000, referer=SEED_PAGE)
+    html, _ = fetch_text(album_url, user_agent=user_agent, timeout=timeout, max_bytes=3_000_000, referer=SEED_PAGE)
     if not html:
         return []
     pics = extract_paintings_from_album(html, album_url)[:max_paintings_per_album]
@@ -619,16 +692,12 @@ def ingest_painting_page(
     timeout: float,
     delay: float,
 ) -> bool:
-    html, fr = fetch_text(painting_url, user_agent=user_agent, timeout=timeout, max_bytes=2_500_000, referer=painting_url)
+    html, _ = fetch_text(painting_url, user_agent=user_agent, timeout=timeout, max_bytes=2_500_000, referer=painting_url)
     if not html:
         return False
 
     title, artist, meta, text = extract_title_artist_meta_and_text(html)
-    img_url = extract_primary_image_url(html, painting_url)
-    if not img_url:
-        # Still usable via iframe even without img_url, but we store page anyway with blank img_url.
-        img_url = ""
-
+    img_url = extract_primary_image_url(html, painting_url) or ""
     tags = infer_style_tags(text)
     upsert_painting(painting_url, img_url, title, artist, meta, tags)
 
@@ -641,27 +710,18 @@ def ingest_painting_page(
 # Display helpers (no server-side downloads)
 # ----------------------------
 def render_painting_display(p: Dict, display_mode: str, height: int = 620):
-    """
-    display_mode:
-      - "iframe": embed painting page (most reliable)
-      - "img": render img_url as browser-side <img> (fast, may fail if blocked)
-    """
     url = p["url"]
     img_url = p.get("img_url") or ""
 
     if display_mode == "iframe":
-        # iframe is most robust and avoids server-side downloading.
         components.iframe(url, height=height, scrolling=True)
         return
 
-    # "img" mode
     if not img_url:
-        st.warning("No image URL extracted; switching to iframe view is recommended.")
+        st.warning("No image URL extracted; using iframe instead.")
         components.iframe(url, height=height, scrolling=True)
         return
 
-    # Browser-side <img> so the user's browser fetches the image (not Streamlit server).
-    # Add max-width and a dark background frame.
     html = f"""
     <div style="width:100%; height:{height}px; display:flex; align-items:center; justify-content:center; background:#111; border-radius:12px; overflow:hidden;">
       <img src="{img_url}" style="max-width:100%; max-height:100%; object-fit:contain;" />
@@ -674,27 +734,18 @@ def render_painting_display(p: Dict, display_mode: str, height: int = 620):
 # Matchmaking + feeds
 # ----------------------------
 def choose_pair_uncertainty(pool: List[Dict], seed: int) -> Optional[Tuple[Dict, Dict]]:
-    """
-    TrueSkill-style matchmaking:
-    - Prefer high sigma (uncertain paintings) so ranking improves fast.
-    - Also prefer not-yet-voted items.
-    """
     if len(pool) < 2:
         return None
 
-    # build weights based on sigma and recency
     weights = []
     for p in pool:
-        # higher sigma => more uncertain => explore
         w = (p["sigma"] ** 1.6)
-        # encourage new paintings
         w *= 1.0 + 0.4 / (p["games"] + 1.0)
         weights.append(w)
 
     probs = softmax([math.log(w + 1e-9) for w in weights])
 
-    # deterministic-ish pick based on hash of seed + time bucket
-    bucket = int(time.time() // 5)  # changes every 5 seconds
+    bucket = int(time.time() // 5)
     h = hashlib.sha1(f"{seed}-{bucket}".encode("utf-8")).hexdigest()
     r = [int(h[i:i+8], 16) / 0xFFFFFFFF for i in range(0, 32, 8)]
 
@@ -715,25 +766,21 @@ def choose_pair_uncertainty(pool: List[Dict], seed: int) -> Optional[Tuple[Dict,
     if a["url"] == b["url"]:
         return pool[0], pool[1]
 
-    # OPTIONAL: make matchups closer in skill (reduce blowouts)
-    # Find candidate b near a’s mu
+    # optionally make matchups closer in mu
     target = a["mu"]
     candidates = sorted(pool, key=lambda p: abs(p["mu"] - target))
     for cand in candidates[:30]:
         if cand["url"] != a["url"]:
             b = cand
             break
-
     return a, b
 
 
 def feed_new(pool: List[Dict], n: int = 30) -> List[Dict]:
-    # least games, most recently seen
     return sorted(pool, key=lambda p: (p["games"], -p["last_seen"]))[:n]
 
 
 def feed_hot(pool: List[Dict], n: int = 30) -> List[Dict]:
-    # "hot" = recent activity + good winrate with at least a few games
     def score(p):
         g = p["games"]
         if g < 5:
@@ -773,7 +820,6 @@ def style_clusters(pool: List[Dict]) -> Dict[str, List[Dict]]:
             for t in tags[:2]:
                 clusters.setdefault(t, []).append(p)
 
-    # sort within cluster by conservative value
     for k in clusters:
         clusters[k] = sorted(clusters[k], key=lambda p: mu_sigma_to_value(p["mu"], p["sigma"]), reverse=True)
     return clusters
@@ -783,13 +829,9 @@ def style_clusters(pool: List[Dict]) -> Dict[str, List[Dict]]:
 # Tournament mode
 # ----------------------------
 def start_tournament(pool: List[Dict], size: int, seed: int) -> List[str]:
-    """
-    Return a list of painting URLs in initial bracket order.
-    """
     if len(pool) < size:
         size = len(pool)
 
-    # choose a mix: half uncertain, half top-value
     pool_sorted_unc = sorted(pool, key=lambda p: p["sigma"], reverse=True)
     pool_sorted_top = sorted(pool, key=lambda p: mu_sigma_to_value(p["mu"], p["sigma"]), reverse=True)
 
@@ -803,11 +845,9 @@ def start_tournament(pool: List[Dict], size: int, seed: int) -> List[str]:
         i += 1
     chosen = list(dict.fromkeys(chosen))[:size]
 
-    # deterministic shuffle by seed
     h = hashlib.sha1(f"tourn-{seed}".encode("utf-8")).hexdigest()
     rot = int(h[:8], 16) % max(1, len(chosen))
-    chosen = chosen[rot:] + chosen[:rot]
-    return chosen
+    return chosen[rot:] + chosen[:rot]
 
 
 def tournament_round_pairs(urls: List[str]) -> List[Tuple[str, str]]:
@@ -823,10 +863,10 @@ def tournament_round_pairs(urls: List[str]) -> List[Tuple[str, str]]:
 st.set_page_config(page_title=APP_NAME, page_icon="🖼️", layout="wide")
 init_db()
 
-st.title("🖼️ Art Mash (Fixed Display + TrueSkill + Tournament)")
+st.title("🖼️ Art Mash (Fully Fixed)")
 st.caption(
-    "Vote between two paintings. Rankings use TrueSkill-lite (mu/sigma). "
-    "Images are displayed without server-side downloading."
+    "Vote between two paintings (source: Gallerix). Rankings use TrueSkill-lite (μ/σ). "
+    "Images are displayed without server-side downloading. DB auto-migrates safely."
 )
 
 with st.sidebar:
@@ -859,6 +899,7 @@ with st.sidebar:
         except Exception as e:
             st.error(f"Failed: {e}")
 
+    st.caption(f"DB path: {DB_PATH}")
 
 tab_vote, tab_crawl, tab_tourn, tab_feeds, tab_leaders = st.tabs(
     ["Vote", "Crawl/Refresh", "Tournament", "Hot/New Feeds", "Leaderboards"]
@@ -930,7 +971,7 @@ with tab_vote:
 with tab_crawl:
     st.subheader("Crawl / Refresh Pool (HTML only)")
     st.write(
-        "This ingests painting pages into SQLite. "
+        "Ingest painting pages into SQLite. "
         "The app never downloads image bytes server-side. "
         "Keep limits small + delays non-zero."
     )
@@ -962,7 +1003,6 @@ with tab_crawl:
                 painting_urls.extend(pics)
                 prog.progress(int(30 * (i + 1) / max(1, len(albums))))
 
-            # dedupe + cap
             seen = set()
             uniq = []
             for u in painting_urls:
@@ -983,10 +1023,7 @@ with tab_crawl:
 
     st.divider()
     st.subheader("Manual ingest")
-    manual_urls = st.text_area(
-        "Paste painting page URLs (one per line)",
-        height=140,
-    )
+    manual_urls = st.text_area("Paste painting page URLs (one per line)", height=140)
     if st.button("Ingest pasted URLs", use_container_width=True):
         urls = [u.strip() for u in manual_urls.splitlines() if u.strip()]
         if not urls:
@@ -1032,7 +1069,6 @@ with tab_tourn:
                 st.success(f"🏆 Champion: {champ.get('title','(unknown)')} — {champ.get('artist','')}")
                 render_painting_display(champ, disp_mode_key, height=int(iframe_height))
             else:
-                # play the first matchup only (clean UX)
                 a_url, b_url = pairs[0]
                 A = get_painting(a_url)
                 B = get_painting(b_url)
@@ -1051,7 +1087,6 @@ with tab_tourn:
                     record_vote(A["url"], B["url"], A["url"], mode="tournament")
                     apply_vote(A["url"], B["url"], mode="tournament")
                     winners.append(A["url"])
-                    # remove first two
                     rest = urls[2:]
                     st.session_state["tourn_urls"] = winners + rest
                     st.session_state["tourn_winners"] = winners
@@ -1067,12 +1102,9 @@ with tab_tourn:
                     st.rerun()
 
                 if c3.button("Skip matchup", use_container_width=True):
-                    # rotate
                     st.session_state["tourn_urls"] = urls[2:] + urls[:2]
                     st.rerun()
 
-            # advance round when all pairs voted
-            # when length is power of two and winners filled up to half, start next round
             if len(urls) in (8, 16, 32, 64) and len(winners) == len(urls) // 2:
                 st.session_state["tourn_urls"] = winners
                 st.session_state["tourn_round"] = int(rnd) + 1
@@ -1109,7 +1141,6 @@ with tab_leaders:
     pool = get_pool(limit=4000)
     st.subheader("Leaderboards (TrueSkill-lite)")
 
-    # Painting leaderboard by conservative value
     top = sorted(pool, key=lambda p: mu_sigma_to_value(p["mu"], p["sigma"]), reverse=True)[:200]
     rows = []
     for i, p in enumerate(top, 1):
