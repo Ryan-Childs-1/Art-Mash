@@ -1,20 +1,21 @@
 # app.py
-# Art Mash — historical art FaceMash using Gallerix (no server-side image downloading)
+# Art Mash — historical art FaceMash using Gallerix (NO server-side image downloading)
 #
-# FIXES (critical):
+# ✅ CHANGE REQUEST IMPLEMENTED:
+# - Crawl source switched to https://gallerix.org/storeroom/
+# - Random letter page: https://gallerix.org/storeroom/letter/H/
+# - Random artist page: https://gallerix.org/storeroom/<artist_id>/
+# - Random paintings pulled from that artist page (painting pages look like: /storeroom/<id>/N/<id>/)
+# - “Surprise me” ingest: add a few new paintings so voting shows new works almost every time.
+#
+# ✅ FIXES:
 # - Robust SQLite schema migrations (handles old DBs on Streamlit Cloud)
 # - DB path auto-resolves to writable location (/tmp) when needed
 # - Safe retry on queries after migration
 #
 # DISPLAY (no downloading art):
 # - iframe embedding painting page (most reliable)
-# - or browser-side <img src="..."> (fast; may fail if CDN blocks)
-#
-# FEATURES:
-# - TrueSkill-lite ratings (mu/sigma) with uncertainty-based matchmaking
-# - Tournament mode (single elimination bracket)
-# - Hot/New feeds
-# - Artist-level rankings + style clustering (heuristic tags)
+# - or browser-side <img src="..."> (fast; may fail if CDN blocks hotlinking)
 #
 # Dependencies: streamlit only (stdlib otherwise)
 
@@ -25,9 +26,10 @@ import json
 import math
 import hashlib
 import sqlite3
+import random
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Tuple
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 from html.parser import HTMLParser
@@ -41,9 +43,10 @@ import streamlit.components.v1 as components
 # ----------------------------
 APP_NAME = "Art Mash"
 BASE = "https://gallerix.org"
-SEED_PAGE = "https://gallerix.org/a1/"  # popular albums list
+STOREROOM_ROOT = "https://gallerix.org/storeroom/"
+LETTER_URL = "https://gallerix.org/storeroom/letter/{L}/"
 
-DEFAULT_UA = "ArtMash/2.1 (Streamlit; respectful crawler)"
+DEFAULT_UA = "ArtMash/2.2 (Streamlit; respectful crawler)"
 CACHE_DIR = ".cache_artmash"
 
 # TrueSkill-lite defaults (similar spirit to TrueSkill)
@@ -68,6 +71,8 @@ STYLE_KEYWORDS = {
     "Neoclassicism": ["neoclassic", "neoclassicism"],
 }
 
+LATIN_LETTERS = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
 
 # ----------------------------
 # DB path + migrations (CRITICAL FIX)
@@ -76,13 +81,12 @@ def resolve_db_path(default_name: str = "artmash.sqlite3") -> str:
     """
     Streamlit Cloud sometimes has repo paths that behave oddly with write permissions.
     Prefer a writable location. /tmp is always writable in Streamlit Cloud containers.
-    You can override via env ART MASH_DB_PATH.
+    Override via env ARTMASH_DB_PATH if desired.
     """
     env = os.getenv("ARTMASH_DB_PATH")
     if env:
         return env
 
-    # If current directory is writable, keep it local (nice for dev).
     try:
         test_path = os.path.join(os.getcwd(), ".write_test")
         with open(test_path, "w") as f:
@@ -98,7 +102,7 @@ DB_PATH = resolve_db_path()
 
 def table_columns(conn: sqlite3.Connection, table: str) -> set:
     cur = conn.execute(f"PRAGMA table_info({table})")
-    return {row[1] for row in cur.fetchall()}  # row[1] is column name
+    return {row[1] for row in cur.fetchall()}
 
 
 def ensure_column(conn: sqlite3.Connection, table: str, col: str, decl: str):
@@ -109,13 +113,6 @@ def ensure_column(conn: sqlite3.Connection, table: str, col: str, decl: str):
 
 
 def migrate_schema(conn: sqlite3.Connection):
-    """
-    Idempotent migrations:
-    - Creates base tables if missing
-    - Adds new columns if missing
-    - Backfills defaults for existing rows
-    """
-    # Base tables (minimal safe schema)
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS paintings (
@@ -146,23 +143,19 @@ def migrate_schema(conn: sqlite3.Connection):
         """
     )
 
-    # Add newer columns safely
     ensure_column(conn, "paintings", "mu", "REAL DEFAULT 25.0")
     ensure_column(conn, "paintings", "sigma", "REAL DEFAULT 8.333")
     ensure_column(conn, "paintings", "tags", "TEXT")
     ensure_column(conn, "paintings", "last_vote", "INTEGER DEFAULT 0")
 
-    # Some older DBs may have votes table without mode
     try:
         ensure_column(conn, "votes", "mode", "TEXT")
     except Exception:
         pass
 
-    # Backfill defaults for existing rows where fields are NULL
     conn.execute("UPDATE paintings SET mu=25.0 WHERE mu IS NULL")
     conn.execute("UPDATE paintings SET sigma=8.333 WHERE sigma IS NULL")
     conn.execute("UPDATE paintings SET last_vote=0 WHERE last_vote IS NULL")
-
     conn.commit()
 
 
@@ -345,30 +338,11 @@ def extract_links(html: str, base_url: str) -> Tuple[List[str], List[str]]:
 
 
 # ----------------------------
-# Gallerix-specific extraction
+# Gallerix extraction
 # ----------------------------
-def is_album_url(u: str) -> bool:
-    return "/album/" in u and "/pic/" not in u
-
-
-def is_painting_url(u: str) -> bool:
-    return "/pic/" in u and "/album/" in u
-
-
-def pick_seed_albums_from_a1(html: str) -> List[str]:
-    links, _ = extract_links(html, SEED_PAGE)
-    albums = [u for u in links if is_album_url(u)]
-    return albums[:400]
-
-
-def extract_paintings_from_album(html: str, album_url: str) -> List[str]:
-    links, _ = extract_links(html, album_url)
-    pics = [u for u in links if is_painting_url(u)]
-    return pics
-
-
 def extract_title_artist_meta_and_text(html: str) -> Tuple[str, str, str, str]:
     title, artist, meta = "", "", ""
+
     m = re.search(r"(?is)<h1[^>]*>(.*?)</h1>", html)
     if m:
         h1 = re.sub(r"(?is)<.*?>", " ", m.group(1))
@@ -413,6 +387,108 @@ def infer_style_tags(text: str) -> List[str]:
         if any(k in t for k in kws):
             tags.append(label)
     return tags[:5]
+
+
+# ----------------------------
+# Storeroom crawling (NEW)
+# ----------------------------
+ARTIST_URL_RE = re.compile(r"^https://gallerix\.org/storeroom/(\d+)/?$")
+PAINTING_URL_RE = re.compile(r"^https://gallerix\.org/storeroom/\d+/N/\d+/?$")
+
+
+def random_letter_url(rng: random.Random) -> str:
+    L = rng.choice(LATIN_LETTERS)
+    return LETTER_URL.format(L=L)
+
+
+def extract_artist_urls_from_letter_page(html: str, letter_page_url: str) -> List[str]:
+    links, _ = extract_links(html, letter_page_url)
+    artists = []
+    for u in links:
+        if ARTIST_URL_RE.match(u):
+            artists.append(u.rstrip("/") + "/")
+    # Deduplicate
+    seen = set()
+    out = []
+    for a in artists:
+        if a not in seen:
+            seen.add(a)
+            out.append(a)
+    return out
+
+
+def extract_painting_urls_from_artist_page(html: str, artist_url: str) -> List[str]:
+    links, _ = extract_links(html, artist_url)
+    pics = []
+    for u in links:
+        if PAINTING_URL_RE.match(u):
+            pics.append(u.rstrip("/") + "/")
+    # Deduplicate
+    seen = set()
+    out = []
+    for p in pics:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
+def choose_random_artist_and_paintings(
+    *,
+    user_agent: str,
+    timeout: float,
+    delay: float,
+    seed: int,
+    max_artist_trials: int = 6,
+    paintings_to_take: int = 10,
+) -> Tuple[Optional[str], List[str], str]:
+    """
+    Picks: random letter -> random artist -> sample paintings from that artist.
+    Returns: (artist_url, painting_urls, debug_status)
+    """
+    rng = random.Random(seed ^ (now_ts() // 3))  # changes often => fresh
+    status_bits = []
+
+    for attempt in range(max_artist_trials):
+        letter_url = random_letter_url(rng)
+        status_bits.append(f"letter={letter_url.split('/')[-2]}")
+
+        l_html, fr = fetch_text(letter_url, user_agent=user_agent, timeout=timeout, max_bytes=3_000_000, referer=STOREROOM_ROOT)
+        if not l_html:
+            status_bits.append(f"letter_fetch_fail({fr.status})")
+            if delay > 0:
+                time.sleep(delay)
+            continue
+
+        artists = extract_artist_urls_from_letter_page(l_html, letter_url)
+        if not artists:
+            status_bits.append("no_artists")
+            if delay > 0:
+                time.sleep(delay)
+            continue
+
+        artist_url = rng.choice(artists)
+        status_bits.append(f"artist={artist_url.rstrip('/').split('/')[-1]}")
+
+        a_html, fr2 = fetch_text(artist_url, user_agent=user_agent, timeout=timeout, max_bytes=4_000_000, referer=letter_url)
+        if not a_html:
+            status_bits.append(f"artist_fetch_fail({fr2.status})")
+            if delay > 0:
+                time.sleep(delay)
+            continue
+
+        pics = extract_painting_urls_from_artist_page(a_html, artist_url)
+        if not pics:
+            status_bits.append("no_paintings_found")
+            if delay > 0:
+                time.sleep(delay)
+            continue
+
+        rng.shuffle(pics)
+        chosen = pics[: max(1, paintings_to_take)]
+        return artist_url, chosen, " | ".join(status_bits)
+
+    return None, [], " | ".join(status_bits) if status_bits else "no_attempts"
 
 
 # ----------------------------
@@ -477,10 +553,6 @@ def get_painting(url: str) -> Optional[Dict]:
 
 
 def get_pool(limit: int = 2000) -> List[Dict]:
-    """
-    Safe select:
-    - If schema is old, migrate + retry.
-    """
     def _run(conn):
         cur = conn.execute(
             """
@@ -557,7 +629,6 @@ def trueskill_lite_update(
     beta: float = TS_BETA,
     tau: float = TS_TAU,
 ) -> Tuple[Tuple[float, float], Tuple[float, float]]:
-    # dynamics
     sig_a = math.sqrt(sig_a * sig_a + tau * tau)
     sig_b = math.sqrt(sig_b * sig_b + tau * tau)
 
@@ -658,34 +729,8 @@ def apply_vote(winner_url: str, loser_url: str, mode: str = "vote"):
 
 
 # ----------------------------
-# Crawling pipeline (HTML only)
+# Ingest painting page (HTML only)
 # ----------------------------
-def crawl_seed_albums(user_agent: str, timeout: float, delay: float, max_albums: int) -> List[str]:
-    html, _ = fetch_text(SEED_PAGE, user_agent=user_agent, timeout=timeout, max_bytes=2_000_000)
-    if not html:
-        return []
-    albums = pick_seed_albums_from_a1(html)[:max_albums]
-    if delay > 0:
-        time.sleep(delay)
-    return albums
-
-
-def crawl_album_for_paintings(
-    album_url: str,
-    user_agent: str,
-    timeout: float,
-    delay: float,
-    max_paintings_per_album: int,
-) -> List[str]:
-    html, _ = fetch_text(album_url, user_agent=user_agent, timeout=timeout, max_bytes=3_000_000, referer=SEED_PAGE)
-    if not html:
-        return []
-    pics = extract_paintings_from_album(html, album_url)[:max_paintings_per_album]
-    if delay > 0:
-        time.sleep(delay)
-    return pics
-
-
 def ingest_painting_page(
     painting_url: str,
     user_agent: str,
@@ -766,7 +811,6 @@ def choose_pair_uncertainty(pool: List[Dict], seed: int) -> Optional[Tuple[Dict,
     if a["url"] == b["url"]:
         return pool[0], pool[1]
 
-    # optionally make matchups closer in mu
     target = a["mu"]
     candidates = sorted(pool, key=lambda p: abs(p["mu"] - target))
     for cand in candidates[:30]:
@@ -776,108 +820,29 @@ def choose_pair_uncertainty(pool: List[Dict], seed: int) -> Optional[Tuple[Dict,
     return a, b
 
 
-def feed_new(pool: List[Dict], n: int = 30) -> List[Dict]:
-    return sorted(pool, key=lambda p: (p["games"], -p["last_seen"]))[:n]
-
-
-def feed_hot(pool: List[Dict], n: int = 30) -> List[Dict]:
-    def score(p):
-        g = p["games"]
-        if g < 5:
-            return -1e9
-        winrate = p["wins"] / max(1, g)
-        rec = p["last_vote"]
-        return 2.5 * winrate + 0.002 * rec + 0.08 * mu_sigma_to_value(p["mu"], p["sigma"])
-    return sorted(pool, key=score, reverse=True)[:n]
-
-
-def artist_rankings(pool: List[Dict], topk: int = 5) -> List[Dict]:
-    by_artist: Dict[str, List[Dict]] = {}
-    for p in pool:
-        a = (p["artist"] or "").strip()
-        if not a:
-            continue
-        by_artist.setdefault(a, []).append(p)
-
-    rows = []
-    for artist, items in by_artist.items():
-        items_sorted = sorted(items, key=lambda p: mu_sigma_to_value(p["mu"], p["sigma"]), reverse=True)
-        pick = items_sorted[:topk]
-        agg = sum(mu_sigma_to_value(p["mu"], p["sigma"]) for p in pick) / max(1, len(pick))
-        games = sum(p["games"] for p in items)
-        rows.append({"artist": artist, "rating": agg, "paintings": len(items), "games": games})
-    rows.sort(key=lambda r: r["rating"], reverse=True)
-    return rows[:200]
-
-
-def style_clusters(pool: List[Dict]) -> Dict[str, List[Dict]]:
-    clusters: Dict[str, List[Dict]] = {}
-    for p in pool:
-        tags = p.get("tags") or []
-        if not tags:
-            clusters.setdefault("Unlabeled", []).append(p)
-        else:
-            for t in tags[:2]:
-                clusters.setdefault(t, []).append(p)
-
-    for k in clusters:
-        clusters[k] = sorted(clusters[k], key=lambda p: mu_sigma_to_value(p["mu"], p["sigma"]), reverse=True)
-    return clusters
-
-
-# ----------------------------
-# Tournament mode
-# ----------------------------
-def start_tournament(pool: List[Dict], size: int, seed: int) -> List[str]:
-    if len(pool) < size:
-        size = len(pool)
-
-    pool_sorted_unc = sorted(pool, key=lambda p: p["sigma"], reverse=True)
-    pool_sorted_top = sorted(pool, key=lambda p: mu_sigma_to_value(p["mu"], p["sigma"]), reverse=True)
-
-    chosen = []
-    i = 0
-    while len(chosen) < size and i < max(len(pool_sorted_unc), len(pool_sorted_top)):
-        if i < len(pool_sorted_unc):
-            chosen.append(pool_sorted_unc[i]["url"])
-        if len(chosen) < size and i < len(pool_sorted_top):
-            chosen.append(pool_sorted_top[i]["url"])
-        i += 1
-    chosen = list(dict.fromkeys(chosen))[:size]
-
-    h = hashlib.sha1(f"tourn-{seed}".encode("utf-8")).hexdigest()
-    rot = int(h[:8], 16) % max(1, len(chosen))
-    return chosen[rot:] + chosen[:rot]
-
-
-def tournament_round_pairs(urls: List[str]) -> List[Tuple[str, str]]:
-    pairs = []
-    for i in range(0, len(urls) - 1, 2):
-        pairs.append((urls[i], urls[i + 1]))
-    return pairs
-
-
 # ----------------------------
 # Streamlit UI
 # ----------------------------
 st.set_page_config(page_title=APP_NAME, page_icon="🖼️", layout="wide")
 init_db()
 
-st.title("🖼️ Art Mash (Fully Fixed)")
+st.title("🖼️ Art Mash (Storeroom Randomized)")
 st.caption(
-    "Vote between two paintings (source: Gallerix). Rankings use TrueSkill-lite (μ/σ). "
-    "Images are displayed without server-side downloading. DB auto-migrates safely."
+    "Now crawls from the Storeroom index (random letter → random artist → random painting pages). "
+    "Images are displayed without server-side downloading."
 )
 
 with st.sidebar:
-    st.header("Source + crawl")
+    st.header("Source + ingest")
     user_agent = st.text_input("User-Agent", value=DEFAULT_UA)
     timeout = st.slider("Timeout (sec)", 3, 30, 10, 1)
     crawl_delay = st.slider("Crawl delay (sec)", 0.0, 2.0, 0.2, 0.05)
 
-    max_albums = st.slider("Albums to sample", 1, 40, 10, 1)
-    max_paintings_per_album = st.slider("Painting links per album", 5, 200, 40, 5)
-    ingest_cap = st.slider("Max painting pages to ingest now", 5, 300, 60, 5)
+    st.divider()
+    st.header("Random ingestion (new)")
+    ingest_paintings_per_click = st.slider("Paintings to ingest per click", 1, 40, 10, 1)
+    artist_trials = st.slider("Artist selection retries", 1, 10, 5, 1)
+    surprise_seed = st.number_input("Random seed", 0, 10_000_000, 1337, 1)
 
     st.divider()
     st.header("Display")
@@ -887,35 +852,48 @@ with st.sidebar:
 
     st.divider()
     st.header("Voting / matchmaking")
-    seed = st.number_input("Match seed", 0, 10_000_000, 1337, 1)
+    match_seed = st.number_input("Match seed", 0, 10_000_000, 2026, 1)
     show_meta = st.checkbox("Show metadata", value=True)
-
-    st.divider()
-    if st.button("🧹 Clear HTML cache (local)", use_container_width=True):
-        try:
-            import shutil
-            shutil.rmtree(CACHE_DIR, ignore_errors=True)
-            st.success("Cache cleared.")
-        except Exception as e:
-            st.error(f"Failed: {e}")
 
     st.caption(f"DB path: {DB_PATH}")
 
-tab_vote, tab_crawl, tab_tourn, tab_feeds, tab_leaders = st.tabs(
-    ["Vote", "Crawl/Refresh", "Tournament", "Hot/New Feeds", "Leaderboards"]
-)
+tab_vote, tab_ingest = st.tabs(["Vote", "Ingest (Storeroom Random)"])
+
 
 # ----------------------------
 # Vote tab
 # ----------------------------
 with tab_vote:
-    pool = get_pool(limit=4000)
+    pool = get_pool(limit=6000)
     st.write(f"Pool size (ingested paintings): **{len(pool)}**")
 
+    # Quick “make it fresh” button
+    c1, c2 = st.columns([1, 3])
+    with c1:
+        if st.button("🎲 Surprise me (ingest new art)", type="primary", use_container_width=True):
+            artist_url, painting_urls, dbg = choose_random_artist_and_paintings(
+                user_agent=user_agent,
+                timeout=float(timeout),
+                delay=float(crawl_delay),
+                seed=int(surprise_seed),
+                max_artist_trials=int(artist_trials),
+                paintings_to_take=int(ingest_paintings_per_click),
+            )
+            if not painting_urls:
+                st.error(f"Could not find paintings. Debug: {dbg}")
+            else:
+                ok = 0
+                for pu in painting_urls:
+                    if ingest_painting_page(pu, user_agent=user_agent, timeout=float(timeout), delay=float(crawl_delay)):
+                        ok += 1
+                st.success(f"Ingested {ok}/{len(painting_urls)} paintings from random artist page.")
+                st.caption(f"Debug: {dbg}")
+                st.rerun()
+
     if len(pool) < 2:
-        st.info("Pool is empty. Go to **Crawl/Refresh** to ingest paintings first.")
+        st.info("Pool is empty. Go to **Ingest** tab (or click Surprise me) to ingest paintings first.")
     else:
-        pair = choose_pair_uncertainty(pool, seed=seed)
+        pair = choose_pair_uncertainty(pool, seed=int(match_seed))
         if not pair:
             st.warning("Unable to choose a pair.")
         else:
@@ -938,8 +916,7 @@ with tab_vote:
 
                         v = mu_sigma_to_value(p["mu"], p["sigma"])
                         st.markdown(f"**μ / σ:** `{p['mu']:.2f}` / `{p['sigma']:.2f}`")
-                        st.markdown(f"**Conservative value:** `{v:.2f}`  |  **Score:** `{value_score_0_100(v):.1f}/100`")
-                        st.markdown(f"**Games:** `{p['games']}`  |  **W-L:** `{p['wins']}-{p['losses']}`")
+                        st.markdown(f"**Score:** `{value_score_0_100(v):.1f}/100`  |  **Games:** `{p['games']}`")
                         st.markdown(f"[Open on Gallerix]({p['url']})")
 
             card(colL, left, "A")
@@ -965,64 +942,42 @@ with tab_vote:
             if skip:
                 st.rerun()
 
+
 # ----------------------------
-# Crawl tab
+# Ingest tab (Storeroom Random)
 # ----------------------------
-with tab_crawl:
-    st.subheader("Crawl / Refresh Pool (HTML only)")
+with tab_ingest:
+    st.subheader("Ingest from Storeroom (random letter → random artist → paintings)")
     st.write(
-        "Ingest painting pages into SQLite. "
-        "The app never downloads image bytes server-side. "
-        "Keep limits small + delays non-zero."
+        "This mode pulls artists from the Storeroom index and samples paintings from a random artist page. "
+        "It’s designed to keep the pool fresh so you see new paintings almost every time."
     )
 
-    if st.button("🔎 Crawl seed albums and ingest paintings", type="primary", use_container_width=True):
-        prog = st.progress(0)
-        status = st.empty()
-
-        albums = crawl_seed_albums(
+    if st.button("🔄 Ingest now (random artist)", type="primary", use_container_width=True):
+        artist_url, painting_urls, dbg = choose_random_artist_and_paintings(
             user_agent=user_agent,
             timeout=float(timeout),
             delay=float(crawl_delay),
-            max_albums=int(max_albums),
+            seed=int(surprise_seed),
+            max_artist_trials=int(artist_trials),
+            paintings_to_take=int(ingest_paintings_per_click),
         )
-        if not albums:
-            st.error("Failed to load seed albums.")
+
+        if not painting_urls:
+            st.error(f"Could not find paintings. Debug: {dbg}")
         else:
-            status.info(f"Found {len(albums)} albums. Extracting painting links…")
-
-            painting_urls: List[str] = []
-            for i, alb in enumerate(albums):
-                pics = crawl_album_for_paintings(
-                    alb,
-                    user_agent=user_agent,
-                    timeout=float(timeout),
-                    delay=float(crawl_delay),
-                    max_paintings_per_album=int(max_paintings_per_album),
-                )
-                painting_urls.extend(pics)
-                prog.progress(int(30 * (i + 1) / max(1, len(albums))))
-
-            seen = set()
-            uniq = []
-            for u in painting_urls:
-                if u not in seen:
-                    seen.add(u)
-                    uniq.append(u)
-            painting_urls = uniq[: int(ingest_cap)]
-
-            status.info(f"Ingesting {len(painting_urls)} painting pages…")
+            prog = st.progress(0)
             ok = 0
             for i, pu in enumerate(painting_urls):
                 if ingest_painting_page(pu, user_agent=user_agent, timeout=float(timeout), delay=float(crawl_delay)):
                     ok += 1
-                prog.progress(30 + int(70 * (i + 1) / max(1, len(painting_urls))))
-
-            status.success(f"Ingest complete. Added/updated {ok} paintings.")
+                prog.progress(int(100 * (i + 1) / max(1, len(painting_urls))))
+            st.success(f"Ingested {ok}/{len(painting_urls)} paintings from: {artist_url or '(unknown)'}")
+            st.caption(f"Debug: {dbg}")
             st.rerun()
 
     st.divider()
-    st.subheader("Manual ingest")
+    st.subheader("Manual ingest (painting page URLs)")
     manual_urls = st.text_area("Paste painting page URLs (one per line)", height=140)
     if st.button("Ingest pasted URLs", use_container_width=True):
         urls = [u.strip() for u in manual_urls.splitlines() if u.strip()]
@@ -1036,151 +991,6 @@ with tab_crawl:
             st.success(f"Ingested {ok}/{min(len(urls),200)} pages.")
             st.rerun()
 
-# ----------------------------
-# Tournament tab
-# ----------------------------
-with tab_tourn:
-    st.subheader("Tournament Mode (Single Elimination)")
-    pool = get_pool(limit=4000)
-
-    if len(pool) < 8:
-        st.info("Need at least 8 ingested paintings. Crawl more first.")
-    else:
-        size = st.select_slider("Tournament size", options=[8, 16, 32, 64], value=16)
-        t_seed = st.number_input("Tournament seed", 0, 10_000_000, 2026, 1)
-        if st.button("Start new tournament", type="primary", use_container_width=True):
-            bracket = start_tournament(pool, size=size, seed=int(t_seed))
-            st.session_state["tourn_urls"] = bracket
-            st.session_state["tourn_round"] = 1
-            st.session_state["tourn_winners"] = []
-            st.rerun()
-
-        urls = st.session_state.get("tourn_urls")
-        rnd = st.session_state.get("tourn_round")
-        winners = st.session_state.get("tourn_winners", [])
-
-        if urls:
-            st.markdown(f"**Round {rnd}** — remaining: `{len(urls)}`")
-            pairs = tournament_round_pairs(urls)
-
-            if not pairs:
-                champ_url = urls[0]
-                champ = get_painting(champ_url)
-                st.success(f"🏆 Champion: {champ.get('title','(unknown)')} — {champ.get('artist','')}")
-                render_painting_display(champ, disp_mode_key, height=int(iframe_height))
-            else:
-                a_url, b_url = pairs[0]
-                A = get_painting(a_url)
-                B = get_painting(b_url)
-                col1, col2 = st.columns(2, gap="large")
-                with col1:
-                    st.subheader("A")
-                    render_painting_display(A, disp_mode_key, height=int(iframe_height))
-                    st.caption(A["title"])
-                with col2:
-                    st.subheader("B")
-                    render_painting_display(B, disp_mode_key, height=int(iframe_height))
-                    st.caption(B["title"])
-
-                c1, c2, c3 = st.columns(3)
-                if c1.button("Vote A wins", use_container_width=True):
-                    record_vote(A["url"], B["url"], A["url"], mode="tournament")
-                    apply_vote(A["url"], B["url"], mode="tournament")
-                    winners.append(A["url"])
-                    rest = urls[2:]
-                    st.session_state["tourn_urls"] = winners + rest
-                    st.session_state["tourn_winners"] = winners
-                    st.rerun()
-
-                if c2.button("Vote B wins", use_container_width=True):
-                    record_vote(A["url"], B["url"], B["url"], mode="tournament")
-                    apply_vote(B["url"], A["url"], mode="tournament")
-                    winners.append(B["url"])
-                    rest = urls[2:]
-                    st.session_state["tourn_urls"] = winners + rest
-                    st.session_state["tourn_winners"] = winners
-                    st.rerun()
-
-                if c3.button("Skip matchup", use_container_width=True):
-                    st.session_state["tourn_urls"] = urls[2:] + urls[:2]
-                    st.rerun()
-
-            if len(urls) in (8, 16, 32, 64) and len(winners) == len(urls) // 2:
-                st.session_state["tourn_urls"] = winners
-                st.session_state["tourn_round"] = int(rnd) + 1
-                st.session_state["tourn_winners"] = []
-                st.rerun()
-
-# ----------------------------
-# Feeds tab
-# ----------------------------
-with tab_feeds:
-    pool = get_pool(limit=4000)
-    st.subheader("Hot & New")
-
-    colA, colB = st.columns(2, gap="large")
-    with colA:
-        st.markdown("### 🔥 Hot")
-        hot = feed_hot(pool, n=40)
-        for p in hot[:15]:
-            v = mu_sigma_to_value(p["mu"], p["sigma"])
-            st.write(f"**{p['title'][:70]}** — {p['artist']} | score {value_score_0_100(v):.1f} | games {p['games']}")
-            st.caption(p["url"])
-
-    with colB:
-        st.markdown("### 🆕 New")
-        new = feed_new(pool, n=40)
-        for p in new[:15]:
-            st.write(f"**{p['title'][:70]}** — {p['artist']} | games {p['games']}")
-            st.caption(p["url"])
-
-# ----------------------------
-# Leaderboards tab
-# ----------------------------
-with tab_leaders:
-    pool = get_pool(limit=4000)
-    st.subheader("Leaderboards (TrueSkill-lite)")
-
-    top = sorted(pool, key=lambda p: mu_sigma_to_value(p["mu"], p["sigma"]), reverse=True)[:200]
-    rows = []
-    for i, p in enumerate(top, 1):
-        v = mu_sigma_to_value(p["mu"], p["sigma"])
-        rows.append({
-            "rank": i,
-            "title": p["title"],
-            "artist": p["artist"],
-            "score_0_100": round(value_score_0_100(v), 1),
-            "mu": round(p["mu"], 2),
-            "sigma": round(p["sigma"], 2),
-            "games": p["games"],
-            "wins": p["wins"],
-            "losses": p["losses"],
-            "tags": ", ".join(p.get("tags") or []),
-            "url": p["url"],
-        })
-
-    st.dataframe(rows, use_container_width=True, height=520)
-    st.download_button(
-        "Download paintings leaderboard JSON",
-        data=json.dumps(rows, indent=2).encode("utf-8"),
-        file_name="artmash_paintings_leaderboard.json",
-        mime="application/json",
-        use_container_width=True,
-    )
-
-    st.divider()
-    st.subheader("Artist-level rankings")
-    artist_rows = artist_rankings(pool, topk=5)
-    st.dataframe(artist_rows, use_container_width=True, height=420)
-
-    st.divider()
-    st.subheader("Style clusters (heuristic tags)")
-    clusters = style_clusters(pool)
-    sel = st.selectbox("Pick a style cluster", sorted(clusters.keys()))
-    sample = clusters.get(sel, [])[:30]
-    for p in sample[:15]:
-        v = mu_sigma_to_value(p["mu"], p["sigma"])
-        st.write(f"**{p['title'][:70]}** — {p['artist']} | score {value_score_0_100(v):.1f} | games {p['games']}")
-        st.caption(p["url"])
-
-st.caption("Tip: Use iframe display mode if images aren’t showing. It avoids hotlink/CDN restrictions entirely.")
+st.caption(
+    "If images fail in 'img tag' mode, switch to 'iframe' mode — it avoids hotlink/CDN restrictions entirely."
+)
