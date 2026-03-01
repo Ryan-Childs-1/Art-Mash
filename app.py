@@ -1,13 +1,12 @@
 # app.py
-# Art Mash — Storeroom Randomized + Full Index Loader + Live Leaderboards (Artist_url canonical)
+# Art Mash — Storeroom Randomized + Resumable Bulk Loader + Live Leaderboards (Stable + Cloud-safe)
 #
-# FIXED (THIS VERSION):
-# ✅ Bulk Load tab loads reliably again (no hidden crashes from unwritable cache/db paths)
-# ✅ Leaderboards load reliably again (removed per-row DB calls that could hang/lock)
-# ✅ Added SQLite busy_timeout + connect timeout (reduces “database is locked” stalls)
-# ✅ Cache directory now auto-falls back to /tmp if current dir isn’t writable
-# ✅ All Streamlit widgets now have explicit unique keys (prevents widget-key collisions across tabs)
-# ✅ Voting remains pair-locked (no rerun mismatch)
+# ✅ Working baseline + fixes:
+# - Voting is pair-locked in session_state (prevents wrong-winner rerun mixups)
+# - Bulk loader is resumable WITHOUT storing giant JSON blobs in ingest_state (uses artists table + last_artist_id cursor)
+# - Leaderboards are live DB queries and robust to NULLs
+# - Cloud-safe filesystem: DB + cache fall back to /tmp when working dir is read-only
+# - SQLite busy_timeout + small retries to reduce "database is locked" issues
 #
 # Dependencies: streamlit only (stdlib otherwise)
 
@@ -29,13 +28,16 @@ from html.parser import HTMLParser
 import streamlit as st
 import streamlit.components.v1 as components
 
+# ----------------------------
+# Constants
+# ----------------------------
 APP_NAME = "Art Mash"
 BASE = "https://gallerix.org"
 STOREROOM_ROOT = "https://gallerix.org/storeroom/"
 LETTER_URL = "https://gallerix.org/storeroom/letter/{L}/"
 DEFAULT_UA = "ArtMash/2.8 (Streamlit; respectful crawler)"
 
-# UI defaults
+# Network defaults (kept simple)
 DEFAULT_TIMEOUT = 10.0
 DEFAULT_DELAY = 0.2
 
@@ -66,9 +68,8 @@ STYLE_KEYWORDS = {
 ARTIST_URL_RE = re.compile(r"^https://gallerix\.org/storeroom/(\d+)/?$")
 PAINTING_URL_RE = re.compile(r"^https://gallerix\.org/storeroom/\d+/N/\d+/?$")
 
-
 # ----------------------------
-# Writable-path helpers (DB + cache)
+# Paths (cloud-safe)
 # ----------------------------
 def _is_writable_dir(path: str) -> bool:
     try:
@@ -81,7 +82,6 @@ def _is_writable_dir(path: str) -> bool:
     except Exception:
         return False
 
-
 def resolve_db_path(default_name: str = "artmash.sqlite3") -> str:
     env = os.getenv("ARTMASH_DB_PATH")
     if env:
@@ -91,28 +91,24 @@ def resolve_db_path(default_name: str = "artmash.sqlite3") -> str:
         return os.path.join(cwd, default_name)
     return os.path.join("/tmp", default_name)
 
-
 def resolve_cache_dir(default_name: str = ".cache_artmash") -> str:
     env = os.getenv("ARTMASH_CACHE_DIR")
     if env:
         return env
     cwd = os.getcwd()
-    if _is_writable_dir(os.path.join(cwd, default_name)):
+    if _is_writable_dir(cwd):
         return os.path.join(cwd, default_name)
-    # Streamlit Cloud reliably allows /tmp
     return os.path.join("/tmp", default_name)
-
 
 DB_PATH = resolve_db_path()
 CACHE_DIR = resolve_cache_dir()
 
-
 # ----------------------------
-# DB
+# SQLite (robust)
 # ----------------------------
 def db() -> sqlite3.Connection:
-    # timeout helps with transient lock; busy_timeout helps too.
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
+    # timeout helps with brief write contention on Streamlit reruns
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30.0)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute("PRAGMA temp_store=MEMORY;")
@@ -120,18 +116,15 @@ def db() -> sqlite3.Connection:
     conn.execute("PRAGMA busy_timeout=5000;")
     return conn
 
-
 def table_columns(conn: sqlite3.Connection, table: str) -> set:
     cur = conn.execute(f"PRAGMA table_info({table})")
     return {row[1] for row in cur.fetchall()}
-
 
 def ensure_column(conn: sqlite3.Connection, table: str, col: str, decl: str):
     cols = table_columns(conn, table)
     if col in cols:
         return
     conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
-
 
 def migrate_schema(conn: sqlite3.Connection):
     conn.execute(
@@ -156,7 +149,6 @@ def migrate_schema(conn: sqlite3.Connection):
         )
         """
     )
-
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS artists (
@@ -167,7 +159,6 @@ def migrate_schema(conn: sqlite3.Connection):
         )
         """
     )
-
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS votes (
@@ -180,7 +171,6 @@ def migrate_schema(conn: sqlite3.Connection):
         )
         """
     )
-
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS ingest_state (
@@ -190,7 +180,7 @@ def migrate_schema(conn: sqlite3.Connection):
         """
     )
 
-    # Backfill older DBs
+    # Backfill for older DBs
     ensure_column(conn, "paintings", "artist_url", "TEXT")
     ensure_column(conn, "paintings", "tags", "TEXT")
     ensure_column(conn, "paintings", "mu", "REAL DEFAULT 25.0")
@@ -205,16 +195,14 @@ def migrate_schema(conn: sqlite3.Connection):
     conn.execute("UPDATE paintings SET sigma=? WHERE sigma IS NULL", (TS_SIGMA0,))
     conn.execute("UPDATE paintings SET last_vote=0 WHERE last_vote IS NULL")
 
-    # Helpful indexes
+    # Indexes
     conn.execute("CREATE INDEX IF NOT EXISTS idx_paintings_last_seen ON paintings(last_seen DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_paintings_last_vote ON paintings(last_vote DESC)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_paintings_artist ON paintings(artist)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_paintings_artist_url ON paintings(artist_url)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_votes_ts ON votes(ts DESC)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_artists_name ON artists(name)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_artists_url ON artists(url)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_artists_name ON artists(name)")
     conn.commit()
-
 
 def init_db():
     conn = db()
@@ -223,26 +211,17 @@ def init_db():
     finally:
         conn.close()
 
-
 # ----------------------------
-# Utils
+# Small helpers
 # ----------------------------
-def ensure_dirs():
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    os.makedirs(os.path.join(CACHE_DIR, "html"), exist_ok=True)
-
+def now_ts() -> int:
+    return int(time.time())
 
 def sha1(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8")).hexdigest()
 
-
-def now_ts() -> int:
-    return int(time.time())
-
-
 def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
-
 
 def parse_artist_url_from_painting(painting_url: str) -> str:
     m = re.search(r"^https://gallerix\.org/storeroom/(\d+)/N/\d+/?$", painting_url)
@@ -250,9 +229,16 @@ def parse_artist_url_from_painting(painting_url: str) -> str:
         return ""
     return f"https://gallerix.org/storeroom/{m.group(1)}/"
 
+def ensure_dirs():
+    # cache is optional; if it fails, we simply skip caching
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        os.makedirs(os.path.join(CACHE_DIR, "html"), exist_ok=True)
+    except Exception:
+        pass
 
 # ----------------------------
-# Fetcher (HTML only, disk cache)
+# Fetcher (HTML only, optional disk cache)
 # ----------------------------
 @dataclass
 class FetchResult:
@@ -263,10 +249,8 @@ class FetchResult:
     url: str
     from_cache: bool
 
-
 def cache_path(kind: str, key: str) -> str:
     return os.path.join(CACHE_DIR, kind, key)
-
 
 def fetch_bytes(
     url: str,
@@ -282,14 +266,15 @@ def fetch_bytes(
     key = sha1(url)
     path = cache_path(cache_kind, key)
 
-    if os.path.exists(path):
-        age = now_ts() - int(os.path.getmtime(path))
-        if age <= cache_ttl_sec:
-            try:
+    # read cache
+    try:
+        if os.path.exists(path):
+            age = now_ts() - int(os.path.getmtime(path))
+            if age <= cache_ttl_sec:
                 data = open(path, "rb").read()
                 return FetchResult(True, "cache", "", data, url, True)
-            except Exception:
-                pass
+    except Exception:
+        pass
 
     headers = {"User-Agent": user_agent, "Accept": "text/html,*/*;q=0.8"}
     if referer:
@@ -301,11 +286,12 @@ def fetch_bytes(
             ctype = (resp.headers.get("Content-Type") or "")
             data = resp.read(max_bytes)
 
+        # write cache (best effort)
         try:
+            ensure_dirs()
             with open(path, "wb") as f:
                 f.write(data)
         except Exception:
-            # cache failures should never kill the app
             pass
 
         return FetchResult(True, "ok", ctype, data, url, False)
@@ -316,7 +302,6 @@ def fetch_bytes(
         return FetchResult(False, f"URL error: {getattr(e, 'reason', e)}", "", None, url, False)
     except Exception as e:
         return FetchResult(False, f"Error: {e}", "", None, url, False)
-
 
 def fetch_text(
     url: str,
@@ -338,7 +323,6 @@ def fetch_text(
         return None, fr
     return fr.data.decode("utf-8", errors="replace"), fr
 
-
 # ----------------------------
 # HTML parsers
 # ----------------------------
@@ -356,10 +340,8 @@ class HrefImgParser(HTMLParser):
         if t == "img" and "src" in a:
             self.img_srcs.append(a["src"])
 
-
 class LinkTextParser(HTMLParser):
     """Captures <a href="...">TEXT</a> reliably (for artist names on letter pages)."""
-
     def __init__(self):
         super().__init__()
         self.links: List[Tuple[str, str]] = []
@@ -388,7 +370,6 @@ class LinkTextParser(HTMLParser):
             self._a_href = ""
             self._buf = []
 
-
 def extract_links(html: str, base_url: str) -> Tuple[List[str], List[str]]:
     p = HrefImgParser()
     p.feed(html)
@@ -415,7 +396,6 @@ def extract_links(html: str, base_url: str) -> Tuple[List[str], List[str]]:
             pass
     return dedupe(hrefs), dedupe(imgs)
 
-
 def extract_link_texts(html: str, base_url: str) -> List[Tuple[str, str]]:
     p = LinkTextParser()
     p.feed(html)
@@ -432,7 +412,6 @@ def extract_link_texts(html: str, base_url: str) -> List[Tuple[str, str]]:
         seen.add(key)
         out.append((u, text))
     return out
-
 
 # ----------------------------
 # Painting page extraction (optional / lazy)
@@ -460,7 +439,6 @@ def extract_title_artist_meta_and_text(html: str) -> Tuple[str, str, str, str]:
     raw_text = re.sub(r"\s+", " ", raw_text).strip()
     return title, artist, meta, raw_text
 
-
 def extract_primary_image_url(html: str, page_url: str) -> Optional[str]:
     _, imgs = extract_links(html, page_url)
     for u in imgs:
@@ -468,7 +446,6 @@ def extract_primary_image_url(html: str, page_url: str) -> Optional[str]:
             return u
     m = re.search(r"(https?://[^\"'\s>]+?\.(?:webp|jpg|jpeg|png))", html, re.I)
     return m.group(1) if m else None
-
 
 def infer_style_tags(text: str) -> List[str]:
     t = (text or "").lower()
@@ -478,12 +455,39 @@ def infer_style_tags(text: str) -> List[str]:
             tags.append(label)
     return tags[:5]
 
+# ----------------------------
+# ingest_state helpers
+# ----------------------------
+def ingest_state_get(key: str, default: str = "") -> str:
+    conn = db()
+    try:
+        migrate_schema(conn)
+        cur = conn.execute("SELECT val FROM ingest_state WHERE key=?", (key,))
+        r = cur.fetchone()
+        return r[0] if r and r[0] is not None else default
+    finally:
+        conn.close()
+
+def ingest_state_set(key: str, val: str):
+    conn = db()
+    try:
+        migrate_schema(conn)
+        conn.execute(
+            """
+            INSERT INTO ingest_state (key, val) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET val=excluded.val
+            """,
+            (key, val),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 # ----------------------------
 # SQLite ops
 # ----------------------------
 def upsert_artist(url: str, name: str):
-    """Upsert artist and backfill paintings missing paintings.artist for this artist_url."""
+    """Upsert artist and backfill paintings.artist when missing."""
     url = (url or "").strip()
     name = (name or "").strip()
     if not url:
@@ -506,7 +510,6 @@ def upsert_artist(url: str, name: str):
             """,
             (url, name or None, now_ts()),
         )
-
         if name:
             conn.execute(
                 """
@@ -521,8 +524,23 @@ def upsert_artist(url: str, name: str):
     finally:
         conn.close()
 
+def get_artist_name(url: str) -> str:
+    if not url:
+        return ""
+    conn = db()
+    try:
+        migrate_schema(conn)
+        cur = conn.execute("SELECT name FROM artists WHERE url=?", (url,))
+        r = cur.fetchone()
+        return (r[0] or "").strip() if r else ""
+    finally:
+        conn.close()
 
 def upsert_minimal_painting(url: str, artist_name: str = "", artist_url: str = "") -> bool:
+    """
+    Insert if missing; update artist fields if provided.
+    Ensures artist_url is populated if parseable.
+    """
     url = (url or "").strip()
     if not url:
         return False
@@ -560,7 +578,6 @@ def upsert_minimal_painting(url: str, artist_name: str = "", artist_url: str = "
         conn.close()
     return inserted
 
-
 def upsert_painting_full(url: str, img_url: str, title: str, artist: str, artist_url: str, meta: str, tags: List[str]):
     conn = db()
     try:
@@ -596,7 +613,6 @@ def upsert_painting_full(url: str, img_url: str, title: str, artist: str, artist
     finally:
         conn.close()
 
-
 def get_pool(limit: int = 4000) -> List[Dict]:
     conn = db()
     try:
@@ -609,7 +625,7 @@ def get_pool(limit: int = 4000) -> List[Dict]:
             ORDER BY last_seen DESC
             LIMIT ?
             """,
-            (limit,),
+            (int(limit),),
         )
         rows = cur.fetchall()
     finally:
@@ -638,7 +654,6 @@ def get_pool(limit: int = 4000) -> List[Dict]:
         )
     return out
 
-
 def get_painting(url: str) -> Optional[Dict]:
     conn = db()
     try:
@@ -654,10 +669,8 @@ def get_painting(url: str) -> Optional[Dict]:
         r = cur.fetchone()
     finally:
         conn.close()
-
     if not r:
         return None
-
     return dict(
         url=r[0],
         img_url=r[1] or "",
@@ -676,7 +689,6 @@ def get_painting(url: str) -> Optional[Dict]:
         last_vote=int(r[14] or 0),
     )
 
-
 def record_vote(left_url: str, right_url: str, winner_url: str, mode: str):
     conn = db()
     try:
@@ -689,38 +701,11 @@ def record_vote(left_url: str, right_url: str, winner_url: str, mode: str):
     finally:
         conn.close()
 
-
-def ingest_state_get(key: str, default: str = "") -> str:
-    conn = db()
-    try:
-        migrate_schema(conn)
-        cur = conn.execute("SELECT val FROM ingest_state WHERE key=?", (key,))
-        r = cur.fetchone()
-        return r[0] if r and r[0] is not None else default
-    finally:
-        conn.close()
-
-
-def ingest_state_set(key: str, val: str):
-    conn = db()
-    try:
-        migrate_schema(conn)
-        conn.execute(
-            """
-            INSERT INTO ingest_state (key, val) VALUES (?, ?)
-            ON CONFLICT(key) DO UPDATE SET val=excluded.val
-            """,
-            (key, val),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-
 # ----------------------------
 # Crawling helpers
 # ----------------------------
 def extract_artist_pairs_from_letter_page(html: str, letter_page_url: str) -> List[Tuple[str, str]]:
+    """Returns (artist_url, artist_name) using anchor text. Filters only storeroom artist URLs."""
     pairs = extract_link_texts(html, letter_page_url)
     out: List[Tuple[str, str]] = []
     seen = set()
@@ -728,6 +713,7 @@ def extract_artist_pairs_from_letter_page(html: str, letter_page_url: str) -> Li
         if ARTIST_URL_RE.match(u):
             au = u.rstrip("/") + "/"
             name = (txt or "").strip()
+            # skip letter navigation etc
             if name and len(name) <= 2 and name.upper() in LATIN_LETTERS:
                 continue
             key = (au, name.lower())
@@ -737,7 +723,6 @@ def extract_artist_pairs_from_letter_page(html: str, letter_page_url: str) -> Li
             out.append((au, name))
     return out
 
-
 def extract_painting_urls_from_artist_page(html: str, artist_url: str) -> List[str]:
     links, _ = extract_links(html, artist_url)
     pics = []
@@ -745,6 +730,7 @@ def extract_painting_urls_from_artist_page(html: str, artist_url: str) -> List[s
         uu = u.rstrip("/") + "/"
         if PAINTING_URL_RE.match(uu):
             pics.append(uu)
+    # stable dedupe
     seen, out = set(), []
     for p in pics:
         if p not in seen:
@@ -752,19 +738,16 @@ def extract_painting_urls_from_artist_page(html: str, artist_url: str) -> List[s
             out.append(p)
     return out
 
-
 def load_all_artists_batch(user_agent: str, timeout: float, delay: float, letters_per_run: int) -> Tuple[int, int, str]:
+    """
+    Loads artists from letter pages A..Z.
+    Progress stored in ingest_state key 'artist_letter_pos' (0..26).
+    """
     pos = int(ingest_state_get("artist_letter_pos", "0") or "0")
-    start = pos
-    end = min(len(LATIN_LETTERS), start + letters_per_run)
+    start = max(0, min(pos, len(LATIN_LETTERS)))
+    end = min(len(LATIN_LETTERS), start + max(1, int(letters_per_run)))
 
-    artists_json = ingest_state_get("artists_json", "[]")
-    try:
-        artists_set = set(json.loads(artists_json))
-    except Exception:
-        artists_set = set()
-
-    added_urls, updated_names = 0, 0
+    added, updated = 0, 0
     dbg = []
 
     for i in range(start, end):
@@ -781,20 +764,26 @@ def load_all_artists_batch(user_agent: str, timeout: float, delay: float, letter
         dbg.append(f"{L}:{len(pairs)}")
 
         for au, name in pairs:
-            if au not in artists_set:
-                artists_set.add(au)
-                added_urls += 1
-            if name:
-                upsert_artist(au, name)
-                updated_names += 1
+            # detect insert vs update count cheaply by checking existence
+            conn = db()
+            try:
+                migrate_schema(conn)
+                cur = conn.execute("SELECT 1 FROM artists WHERE url=? LIMIT 1", (au,))
+                exists = cur.fetchone() is not None
+            finally:
+                conn.close()
+
+            upsert_artist(au, name)
+            if exists:
+                updated += 1
+            else:
+                added += 1
 
         if delay > 0:
             time.sleep(delay)
 
-    ingest_state_set("artists_json", json.dumps(sorted(list(artists_set))))
-    ingest_state_set("artist_letter_pos", str(end if end < len(LATIN_LETTERS) else len(LATIN_LETTERS)))
-    return added_urls, updated_names, " | ".join(dbg) if dbg else "no-op"
-
+    ingest_state_set("artist_letter_pos", str(end))
+    return added, updated, " | ".join(dbg) if dbg else "no-op"
 
 def load_all_paintings_batch(
     user_agent: str,
@@ -803,45 +792,45 @@ def load_all_paintings_batch(
     artists_per_run: int,
     paintings_cap_per_artist: int,
 ) -> Tuple[int, int, int, str]:
-    artists_json = ingest_state_get("artists_json", "[]")
+    """
+    Crawls artists from the artists table (no giant JSON stored).
+    Progress stored in ingest_state key 'last_artist_id' (cursor by artists.id).
+    """
+    last_id = int(ingest_state_get("last_artist_id", "0") or "0")
+
+    conn = db()
     try:
-        artists = json.loads(artists_json)
-    except Exception:
-        artists = []
+        migrate_schema(conn)
+        total_artists = conn.execute("SELECT COUNT(*) FROM artists").fetchone()[0]
+        cur = conn.execute(
+            "SELECT id, url, COALESCE(name,'') FROM artists WHERE id > ? ORDER BY id ASC LIMIT ?",
+            (last_id, int(artists_per_run)),
+        )
+        artist_rows = cur.fetchall()
+    finally:
+        conn.close()
 
-    if not artists:
-        return 0, 0, 0, "No artists loaded yet. Run 'Load artists' first."
-
-    idx = int(ingest_state_get("artist_idx", "0") or "0")
-    start = idx
-    end = min(len(artists), start + artists_per_run)
+    if total_artists == 0:
+        return 0, 0, 0, "No artists loaded yet. Run step 1 (Load artists) first."
+    if not artist_rows:
+        return 0, 0, 0, "No remaining artists in this crawl. (You're done!)"
 
     unique_inserts = 0
     artists_done = 0
     missing_names = 0
     dbg = []
 
-    for i in range(start, end):
-        artist_url = artists[i]
-        html, fr = fetch_text(
-            artist_url, user_agent=user_agent, timeout=timeout, max_bytes=4_000_000, referer=STOREROOM_ROOT
-        )
+    max_seen_id = last_id
+    for artist_id, artist_url, name in artist_rows:
+        max_seen_id = max(max_seen_id, int(artist_id))
+        html, fr = fetch_text(artist_url, user_agent=user_agent, timeout=timeout, max_bytes=4_000_000, referer=STOREROOM_ROOT)
         if not html:
             dbg.append(f"artist:fail({fr.status})")
             if delay > 0:
                 time.sleep(delay)
             continue
 
-        # Name from DB if known; else pull h1 and upsert
-        name = ""
-        conn = db()
-        try:
-            migrate_schema(conn)
-            r = conn.execute("SELECT name FROM artists WHERE url=?", (artist_url,)).fetchone()
-            name = (r[0] or "").strip() if r else ""
-        finally:
-            conn.close()
-
+        name = (name or "").strip()
         if not name:
             m = re.search(r"(?is)<h1[^>]*>(.*?)</h1>", html)
             if m:
@@ -855,7 +844,7 @@ def load_all_paintings_batch(
 
         pics = extract_painting_urls_from_artist_page(html, artist_url)
         if paintings_cap_per_artist > 0:
-            pics = pics[:paintings_cap_per_artist]
+            pics = pics[: int(paintings_cap_per_artist)]
 
         for pu in pics:
             if upsert_minimal_painting(pu, artist_name=name, artist_url=artist_url):
@@ -867,10 +856,9 @@ def load_all_paintings_batch(
         if delay > 0:
             time.sleep(delay)
 
-    ingest_state_set("artist_idx", str(end if end < len(artists) else len(artists)))
+    ingest_state_set("last_artist_id", str(max_seen_id))
     status = " | ".join(dbg[:8]) + (" | …" if len(dbg) > 8 else "")
     return unique_inserts, artists_done, missing_names, status
-
 
 # ----------------------------
 # Vote / rating system
@@ -878,10 +866,8 @@ def load_all_paintings_batch(
 def normal_pdf(x: float) -> float:
     return math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
 
-
 def normal_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
-
 
 def trueskill_lite_update(
     mu_a: float,
@@ -892,6 +878,7 @@ def trueskill_lite_update(
     beta: float = TS_BETA,
     tau: float = TS_TAU,
 ) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+    # dynamics
     sig_a = math.sqrt(sig_a * sig_a + tau * tau)
     sig_b = math.sqrt(sig_b * sig_b + tau * tau)
 
@@ -922,7 +909,6 @@ def trueskill_lite_update(
 
     return (mu_a_new, math.sqrt(max(sig_a2, 1e-6))), (mu_b_new, math.sqrt(max(sig_b2, 1e-6)))
 
-
 def k_factor(games: int) -> float:
     if games < 10:
         return 48.0
@@ -930,59 +916,64 @@ def k_factor(games: int) -> float:
         return 28.0
     return 16.0
 
-
 def elo_expected(r_a: float, r_b: float) -> float:
     return 1.0 / (1.0 + 10 ** ((r_b - r_a) / 400.0))
-
 
 def elo_update(r_a: float, r_b: float, score_a: float, k: float) -> Tuple[float, float]:
     ea = elo_expected(r_a, r_b)
     eb = 1.0 - ea
     return (r_a + k * (score_a - ea), r_b + k * ((1.0 - score_a) - eb))
 
-
 def mu_sigma_to_value(mu: float, sigma: float) -> float:
     return float(mu) - 3.0 * float(sigma)
-
 
 def value_score_0_100(v: float) -> float:
     return clamp((v / 40.0) * 100.0, 0.0, 100.0)
 
-
 def apply_vote(winner_url: str, loser_url: str):
+    # Always updates winner positively, loser negatively
     w = get_painting(winner_url)
     l = get_painting(loser_url)
     if not w or not l:
         return
 
-    k = (k_factor(w["games"]) + k_factor(l["games"])) / 2.0
-    new_rw, new_rl = elo_update(w["elo"], l["elo"], 1.0, k)
-    (mu_w, sig_w), (mu_l, sig_l) = trueskill_lite_update(w["mu"], w["sigma"], l["mu"], l["sigma"], True)
+    k = (k_factor(int(w["games"])) + k_factor(int(l["games"]))) / 2.0
+    new_rw, new_rl = elo_update(float(w["elo"]), float(l["elo"]), 1.0, k)
+    (mu_w, sig_w), (mu_l, sig_l) = trueskill_lite_update(float(w["mu"]), float(w["sigma"]), float(l["mu"]), float(l["sigma"]), True)
 
     ts = now_ts()
-    conn = db()
-    try:
-        migrate_schema(conn)
-        conn.execute(
-            """
-            UPDATE paintings
-            SET elo=?, mu=?, sigma=?, games=games+1, wins=wins+1, last_vote=?
-            WHERE url=?
-            """,
-            (new_rw, mu_w, sig_w, ts, winner_url),
-        )
-        conn.execute(
-            """
-            UPDATE paintings
-            SET elo=?, mu=?, sigma=?, games=games+1, losses=losses+1, last_vote=?
-            WHERE url=?
-            """,
-            (new_rl, mu_l, sig_l, ts, loser_url),
-        )
-        conn.commit()
-    finally:
-        conn.close()
 
+    # retry on transient lock
+    for attempt in range(3):
+        try:
+            conn = db()
+            try:
+                migrate_schema(conn)
+                conn.execute(
+                    """
+                    UPDATE paintings
+                    SET elo=?, mu=?, sigma=?, games=games+1, wins=wins+1, last_vote=?
+                    WHERE url=?
+                    """,
+                    (new_rw, mu_w, sig_w, ts, winner_url),
+                )
+                conn.execute(
+                    """
+                    UPDATE paintings
+                    SET elo=?, mu=?, sigma=?, games=games+1, losses=losses+1, last_vote=?
+                    WHERE url=?
+                    """,
+                    (new_rl, mu_l, sig_l, ts, loser_url),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            break
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e).lower() and attempt < 2:
+                time.sleep(0.15 * (attempt + 1))
+                continue
+            raise
 
 # ----------------------------
 # Leaderboards (live queries)
@@ -1035,7 +1026,6 @@ def paintings_leaderboard_live(limit: int, min_games: int) -> List[Dict]:
         )
     return out
 
-
 def artists_leaderboard_live(
     limit: int,
     topk: int,
@@ -1044,8 +1034,9 @@ def artists_leaderboard_live(
     include_unknown: bool,
 ) -> List[Dict]:
     """
-    FIX: This function previously could “hang” by calling DB per row via get_artist_name().
-    Now it does ONE joined query and never opens extra connections inside loops.
+    Canonical grouping by artist_url (stable).
+    Display name uses paintings.artist, else artists.name, else URL.
+    Artist score = mean of top-k painting conservative values.
     """
     conn = db()
     try:
@@ -1053,8 +1044,8 @@ def artists_leaderboard_live(
         cur = conn.execute(
             """
             SELECT
-                COALESCE(NULLIF(TRIM(p.artist_url),''), '') AS artist_url,
-                COALESCE(NULLIF(TRIM(p.artist),''), NULLIF(TRIM(a.name),''), '') AS artist_name,
+                COALESCE(p.artist_url,'') AS artist_url,
+                COALESCE(NULLIF(TRIM(p.artist),''), a.name, '') AS artist_name,
                 p.url,
                 COALESCE(NULLIF(TRIM(p.title),''),'') AS title,
                 COALESCE(p.mu, ?) AS mu,
@@ -1073,16 +1064,14 @@ def artists_leaderboard_live(
     buckets: Dict[str, Dict] = {}
     for artist_url, artist_name, url, title, mu, sigma, games in rows:
         artist_url = (artist_url or "").strip()
-        artist_name = (artist_name or "").strip()
-
         if not artist_url:
             if not include_unknown:
                 continue
             bucket_key = "unknown"
-            display_name = artist_name or "Unknown artist"
+            display_name = (artist_name or "").strip() or "Unknown artist"
         else:
             bucket_key = artist_url
-            display_name = artist_name or artist_url  # last-resort fallback
+            display_name = (artist_name or "").strip() or get_artist_name(artist_url) or artist_url
 
         if bucket_key not in buckets:
             buckets[bucket_key] = {"artist": display_name, "artist_url": artist_url, "items": [], "games_total": 0}
@@ -1114,7 +1103,6 @@ def artists_leaderboard_live(
         )
 
     agg_rows.sort(key=lambda r: (float(r["value"]), int(r["games"]), int(r["paintings"])), reverse=True)
-
     out = []
     for i, r in enumerate(agg_rows[: int(limit)], 1):
         out.append(
@@ -1132,25 +1120,21 @@ def artists_leaderboard_live(
         )
     return out
 
-
 # ----------------------------
 # Rendering
 # ----------------------------
 def render_painting_display(p: Dict, display_mode: str, height: int = 620):
     url = p["url"]
     img_url = p.get("img_url") or ""
-
     if display_mode == "iframe" or not img_url:
         components.iframe(url, height=height, scrolling=True)
         return
-
     html = f"""
     <div style="width:100%; height:{height}px; display:flex; align-items:center; justify-content:center; background:#111; border-radius:12px; overflow:hidden;">
       <img src="{img_url}" style="max-width:100%; max-height:100%; object-fit:contain;" />
     </div>
     """
     components.html(html, height=height, scrolling=False)
-
 
 # ----------------------------
 # Optional enrichment
@@ -1166,7 +1150,9 @@ def ingest_painting_page_full(painting_url: str, user_agent: str, timeout: float
 
     artist_url = parse_artist_url_from_painting(painting_url)
     artist_name = (artist_from_page or "").strip()
-
+    known = get_artist_name(artist_url) if artist_url else ""
+    if known:
+        artist_name = known
     if artist_url and artist_name:
         upsert_artist(artist_url, artist_name)
 
@@ -1175,7 +1161,6 @@ def ingest_painting_page_full(painting_url: str, user_agent: str, timeout: float
     if delay > 0:
         time.sleep(delay)
     return True
-
 
 # ----------------------------
 # Queue + locked matchup logic (session)
@@ -1187,7 +1172,6 @@ def build_session_queue(limit: int, seed: int) -> List[str]:
     rng.shuffle(urls)
     return urls
 
-
 def next_from_queue() -> Optional[str]:
     q = st.session_state.get("queue_urls", [])
     idx = st.session_state.get("queue_idx", 0)
@@ -1196,7 +1180,6 @@ def next_from_queue() -> Optional[str]:
     url = q[idx % len(q)]
     st.session_state["queue_idx"] = (idx + 1) % len(q)
     return url
-
 
 def pick_pair_from_queue() -> Optional[Tuple[Dict, Dict]]:
     a_url = next_from_queue()
@@ -1209,20 +1192,16 @@ def pick_pair_from_queue() -> Optional[Tuple[Dict, Dict]]:
         return None
     return A, B
 
-
 def set_current_pair(left_url: str, right_url: str):
     st.session_state["current_left_url"] = left_url
     st.session_state["current_right_url"] = right_url
 
-
 def get_current_pair_urls() -> Tuple[Optional[str], Optional[str]]:
     return st.session_state.get("current_left_url"), st.session_state.get("current_right_url")
-
 
 def clear_current_pair():
     st.session_state.pop("current_left_url", None)
     st.session_state.pop("current_right_url", None)
-
 
 # ----------------------------
 # Streamlit UI
@@ -1261,7 +1240,6 @@ if rebuild_queue or "queue_urls" not in st.session_state:
 if "seen_urls" not in st.session_state:
     st.session_state["seen_urls"] = set()
 
-
 # ----------------------------
 # Vote tab (pair-locked)
 # ----------------------------
@@ -1294,6 +1272,7 @@ with tabs[0]:
     st.session_state["seen_urls"].add(left["url"])
     st.session_state["seen_urls"].add(right["url"])
 
+    # Optional lazy enrich for img-tag mode
     if disp_mode_key == "img":
         if (not left.get("img_url")) or (not left.get("title")) or (not left.get("artist")):
             ingest_painting_page_full(left["url"], DEFAULT_UA, float(DEFAULT_TIMEOUT), 0.0)
@@ -1347,173 +1326,165 @@ with tabs[0]:
         clear_current_pair()
         st.rerun()
 
-
 # ----------------------------
 # Bulk Load tab
 # ----------------------------
 with tabs[1]:
+    st.subheader("Bulk Loader (Resumable)")
+    st.write(
+        "Step 1 loads artists from A..Z letter pages and stores artist **names**. "
+        "Step 2 crawls each artist page to store painting URLs and attaches those names."
+    )
+
+    with st.expander("Loader settings", expanded=True):
+        user_agent = st.text_input("User-Agent", value=DEFAULT_UA, key="bl_ua")
+        timeout = st.slider("Timeout (sec)", 3, 30, int(DEFAULT_TIMEOUT), 1, key="bl_timeout")
+        crawl_delay = st.slider("Crawl delay (sec)", 0.0, 2.0, float(DEFAULT_DELAY), 0.05, key="bl_delay")
+
+        cA, cB, cC = st.columns(3)
+        with cA:
+            letters_per_run = st.slider("Letters per run (artists)", 1, 26, 6, 1, key="bl_letters")
+        with cB:
+            artists_per_run = st.slider("Artists per run (paintings)", 1, 500, 50, 1, key="bl_artists_per")
+        with cC:
+            cap_per_artist = st.slider("Cap paintings per artist (0 = no cap)", 0, 5000, 0, 50, key="bl_cap")
+
+        st.caption(f"DB path: {DB_PATH}")
+        st.caption(f"Cache dir: {CACHE_DIR}")
+
+    # progress + stats (from DB, not ingest_state JSON)
+    conn = db()
     try:
-        st.subheader("Bulk Loader (Resumable)")
-        st.write(
-            "Step 1 loads artists from A..Z letter pages and stores artist **names**. "
-            "Step 2 crawls each artist page to store painting URLs and attaches those names."
-        )
+        migrate_schema(conn)
+        artist_count = conn.execute("SELECT COUNT(*) FROM artists").fetchone()[0]
+        painting_count = conn.execute("SELECT COUNT(*) FROM paintings").fetchone()[0]
+    finally:
+        conn.close()
 
-        with st.expander("Loader settings", expanded=True):
-            user_agent = st.text_input("User-Agent", value=DEFAULT_UA, key="bl_ua")
-            timeout = st.slider("Timeout (sec)", 3, 30, int(DEFAULT_TIMEOUT), 1, key="bl_timeout")
-            crawl_delay = st.slider("Crawl delay (sec)", 0.0, 2.0, float(DEFAULT_DELAY), 0.05, key="bl_delay")
+    letter_pos = int(ingest_state_get("artist_letter_pos", "0") or "0")
+    last_artist_id = int(ingest_state_get("last_artist_id", "0") or "0")
 
-            cA, cB, cC = st.columns(3)
-            with cA:
-                letters_per_run = st.slider("Letters per run (artists)", 1, 26, 6, 1, key="bl_letters")
-            with cB:
-                artists_per_run = st.slider("Artists per run (paintings)", 1, 500, 50, 1, key="bl_artists_per")
-            with cC:
-                cap_per_artist = st.slider("Cap paintings per artist (0 = no cap)", 0, 5000, 0, 50, key="bl_cap")
+    st.info(
+        f"Artists in DB: **{artist_count}** | Paintings in DB: **{painting_count}** | "
+        f"Letter progress: **{letter_pos}/26** | Artist crawl cursor id: **{last_artist_id}**"
+    )
 
-            st.caption(f"DB path: {DB_PATH}")
-            st.caption(f"Cache dir: {CACHE_DIR}")
+    c1, c2 = st.columns(2, gap="large")
 
-        artists_json = ingest_state_get("artists_json", "[]")
-        try:
-            artists_list = json.loads(artists_json)
-        except Exception:
-            artists_list = []
-        letter_pos = int(ingest_state_get("artist_letter_pos", "0") or "0")
-        artist_idx = int(ingest_state_get("artist_idx", "0") or "0")
-
-        st.info(
-            f"Artists loaded: **{len(artists_list)}** | Letter progress: **{letter_pos}/26** | "
-            f"Artist progress: **{artist_idx}/{len(artists_list) or 0}**"
-        )
-
-        c1, c2 = st.columns(2, gap="large")
-
-        with c1:
-            if st.button("1) Load artists (batch)", type="primary", use_container_width=True, key="bl_load_artists"):
-                added_urls, updated_names, status = load_all_artists_batch(
-                    user_agent=user_agent,
-                    timeout=float(timeout),
-                    delay=float(crawl_delay),
-                    letters_per_run=int(letters_per_run),
-                )
-                st.success(f"Added {added_urls} artist URLs; updated {updated_names} names. {status}")
-                st.rerun()
-
-            if st.button("Reset letter progress", use_container_width=True, key="bl_reset_letters"):
-                ingest_state_set("artist_letter_pos", "0")
-                st.warning("Reset letter progress to 0.")
-                st.rerun()
-
-        with c2:
-            if st.button("2) Load paintings (batch)", type="primary", use_container_width=True, key="bl_load_paintings"):
-                unique_inserts, artists_done, missing_names, status = load_all_paintings_batch(
-                    user_agent=user_agent,
-                    timeout=float(timeout),
-                    delay=float(crawl_delay),
-                    artists_per_run=int(artists_per_run),
-                    paintings_cap_per_artist=int(cap_per_artist),
-                )
-                st.success(
-                    f"Inserted {unique_inserts} new painting URLs from {artists_done} artists. "
-                    f"Missing names: {missing_names}. {status}"
-                )
-                st.session_state["queue_urls"] = build_session_queue(limit=int(queue_limit), seed=int(queue_seed))
-                st.session_state["queue_idx"] = 0
-                clear_current_pair()
-                st.rerun()
-
-            if st.button("Reset artist crawl index", use_container_width=True, key="bl_reset_artist_idx"):
-                ingest_state_set("artist_idx", "0")
-                st.warning("Reset artist crawl index to 0.")
-                st.rerun()
-
-        st.divider()
-        st.subheader("Optional: enrich a random sample (titles / img URLs)")
-        st.write("Fetches ONLY HTML for a sample of painting pages to improve metadata. Still no image downloads server-side.")
-
-        enrich_n = st.slider("Enrich N paintings now", 0, 200, 20, 5, key="bl_enrich_n")
-        if st.button("Enrich sample", use_container_width=True, key="bl_enrich_btn") and enrich_n > 0:
-            pool = get_pool(limit=max(500, enrich_n * 10))
-            rng = random.Random(int(queue_seed) ^ (now_ts() // 10))
-            rng.shuffle(pool)
-            sample = pool[:enrich_n]
-            prog = st.progress(0)
-            ok = 0
-            for i, p in enumerate(sample):
-                if ingest_painting_page_full(p["url"], user_agent, float(timeout), float(crawl_delay)):
-                    ok += 1
-                prog.progress(int(100 * (i + 1) / max(1, len(sample))))
-            st.success(f"Enriched {ok}/{len(sample)} paintings.")
+    with c1:
+        if st.button("1) Load artists (batch)", type="primary", use_container_width=True, key="bl_load_artists"):
+            added, updated, status = load_all_artists_batch(
+                user_agent=user_agent,
+                timeout=float(timeout),
+                delay=float(crawl_delay),
+                letters_per_run=int(letters_per_run),
+            )
+            st.success(f"Added {added} artists; updated {updated} rows. {status}")
             st.rerun()
 
-    except Exception as e:
-        st.error(f"Bulk Load tab error: {e}")
-        st.exception(e)
+        if st.button("Reset letter progress", use_container_width=True, key="bl_reset_letters"):
+            ingest_state_set("artist_letter_pos", "0")
+            st.warning("Reset letter progress to 0.")
+            st.rerun()
 
+    with c2:
+        if st.button("2) Load paintings (batch)", type="primary", use_container_width=True, key="bl_load_paintings"):
+            unique_inserts, artists_done, missing_names, status = load_all_paintings_batch(
+                user_agent=user_agent,
+                timeout=float(timeout),
+                delay=float(crawl_delay),
+                artists_per_run=int(artists_per_run),
+                paintings_cap_per_artist=int(cap_per_artist),
+            )
+            st.success(
+                f"Inserted {unique_inserts} new painting URLs from {artists_done} artists. "
+                f"Missing names: {missing_names}. {status}"
+            )
+            st.session_state["queue_urls"] = build_session_queue(limit=int(queue_limit), seed=int(queue_seed))
+            st.session_state["queue_idx"] = 0
+            clear_current_pair()
+            st.rerun()
+
+        if st.button("Reset artist crawl cursor", use_container_width=True, key="bl_reset_artist_cursor"):
+            ingest_state_set("last_artist_id", "0")
+            st.warning("Reset artist crawl cursor to 0.")
+            st.rerun()
+
+    st.divider()
+    st.subheader("Optional: enrich a random sample (titles / img URLs)")
+    st.write("Fetches ONLY HTML for a sample of painting pages to improve metadata. Still no image downloads server-side.")
+
+    enrich_n = st.slider("Enrich N paintings now", 0, 200, 20, 5, key="bl_enrich_n")
+    if st.button("Enrich sample", use_container_width=True, key="bl_enrich_btn") and enrich_n > 0:
+        pool = get_pool(limit=max(500, enrich_n * 10))
+        rng = random.Random(int(queue_seed) ^ (now_ts() // 10))
+        rng.shuffle(pool)
+        sample = pool[: int(enrich_n)]
+        prog = st.progress(0)
+        ok = 0
+        for i, p in enumerate(sample):
+            if ingest_painting_page_full(p["url"], user_agent, float(timeout), float(crawl_delay)):
+                ok += 1
+            prog.progress(int(100 * (i + 1) / max(1, len(sample))))
+        st.success(f"Enriched {ok}/{len(sample)} paintings.")
+        st.rerun()
 
 # ----------------------------
 # Leaderboards tab
 # ----------------------------
 with tabs[2]:
-    try:
-        st.subheader("Leaderboards (Live)")
+    st.subheader("Leaderboards (Live)")
 
-        top_cols = st.columns(2)
-        with top_cols[0]:
-            top_p = st.slider("Top N paintings", 25, 1000, 200, 25, key="lb_top_paintings")
-        with top_cols[1]:
-            min_pg = st.slider("Min games per painting", 0, 50, 1, 1, key="lb_min_games_painting")
+    top_cols = st.columns(2)
+    with top_cols[0]:
+        top_p = st.slider("Top N paintings", 25, 1000, 200, 25, key="lb_top_paintings")
+    with top_cols[1]:
+        min_pg = st.slider("Min games per painting", 0, 50, 1, 1, key="lb_min_games_painting")
 
-        prow = paintings_leaderboard_live(limit=int(top_p), min_games=int(min_pg))
-        st.markdown("### 🏆 Top Paintings")
-        st.dataframe(prow, use_container_width=True, height=520)
+    prow = paintings_leaderboard_live(limit=int(top_p), min_games=int(min_pg))
+    st.markdown("### 🏆 Top Paintings")
+    st.dataframe(prow, use_container_width=True, height=520)
 
-        st.download_button(
-            "Download paintings leaderboard JSON",
-            data=json.dumps(prow, indent=2).encode("utf-8"),
-            file_name="artmash_paintings_leaderboard.json",
-            mime="application/json",
-            use_container_width=True,
-            key="lb_dl_paintings",
-        )
+    st.download_button(
+        "Download paintings leaderboard JSON",
+        data=json.dumps(prow, indent=2).encode("utf-8"),
+        file_name="artmash_paintings_leaderboard.json",
+        mime="application/json",
+        use_container_width=True,
+        key="lb_dl_paintings",
+    )
 
-        st.divider()
-        st.markdown("### 🎨 Top Artists (Canonical by artist URL)")
+    st.divider()
+    st.markdown("### 🎨 Top Artists (Canonical by artist URL)")
 
-        a1, a2, a3, a4 = st.columns(4)
-        with a1:
-            top_a = st.slider("Top N artists", 25, 1000, 200, 25, key="lb_top_artists")
-        with a2:
-            topk = st.slider("Aggregate top-k paintings", 1, 20, 5, 1, key="lb_topk")
-        with a3:
-            min_ag = st.slider("Min total games per artist", 0, 500, 5, 1, key="lb_min_artist_games")
-        with a4:
-            min_paint_games = st.slider("Min games per painting (artist agg)", 0, 50, 1, 1, key="lb_min_paint_games")
+    a1, a2, a3, a4 = st.columns(4)
+    with a1:
+        top_a = st.slider("Top N artists", 25, 1000, 200, 25, key="lb_top_artists")
+    with a2:
+        topk = st.slider("Aggregate top-k paintings", 1, 20, 5, 1, key="lb_topk")
+    with a3:
+        min_ag = st.slider("Min total games per artist", 0, 500, 5, 1, key="lb_min_artist_games")
+    with a4:
+        min_paint_games = st.slider("Min games per painting (artist agg)", 0, 50, 1, 1, key="lb_min_paint_games")
 
-        include_unknown = st.checkbox("Include Unknown artist bucket", value=False, key="lb_include_unknown")
+    include_unknown = st.checkbox("Include Unknown artist bucket", value=False, key="lb_include_unknown")
 
-        arow = artists_leaderboard_live(
-            limit=int(top_a),
-            topk=int(topk),
-            min_artist_games=int(min_ag),
-            min_painting_games=int(min_paint_games),  # ✅ FIXED NAME
-            include_unknown=bool(include_unknown),
-        )
-        st.dataframe(arow, use_container_width=True, height=520)
+    arow = artists_leaderboard_live(
+        limit=int(top_a),
+        topk=int(topk),
+        min_artist_games=int(min_ag),
+        min_painting_games=int(min_paint_games),
+        include_unknown=bool(include_unknown),
+    )
+    st.dataframe(arow, use_container_width=True, height=520)
 
-        st.download_button(
-            "Download artist leaderboard JSON",
-            data=json.dumps(arow, indent=2).encode("utf-8"),
-            file_name="artmash_artist_leaderboard.json",
-            mime="application/json",
-            use_container_width=True,
-            key="lb_dl_artists",
-        )
-
-    except Exception as e:
-        st.error(f"Leaderboards tab error: {e}")
-        st.exception(e)
+    st.download_button(
+        "Download artist leaderboard JSON",
+        data=json.dumps(arow, indent=2).encode("utf-8"),
+        file_name="artmash_artist_leaderboard.json",
+        mime="application/json",
+        use_container_width=True,
+        key="lb_dl_artists",
+    )
 
 st.caption("Tip: If images do not show in img-tag mode (hotlink restrictions), use iframe mode.")
