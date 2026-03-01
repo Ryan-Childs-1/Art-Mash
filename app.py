@@ -1294,7 +1294,6 @@ with tabs[0]:
     st.session_state["seen_urls"].add(left["url"])
     st.session_state["seen_urls"].add(right["url"])
 
-    # Optional lazy enrich for img-tag mode
     if disp_mode_key == "img":
         if (not left.get("img_url")) or (not left.get("title")) or (not left.get("artist")):
             ingest_painting_page_full(left["url"], DEFAULT_UA, float(DEFAULT_TIMEOUT), 0.0)
@@ -1353,158 +1352,168 @@ with tabs[0]:
 # Bulk Load tab
 # ----------------------------
 with tabs[1]:
-    st.subheader("Bulk Loader (Resumable)")
-    st.write(
-        "Step 1 loads artists from A..Z letter pages and stores artist **names**. "
-        "Step 2 crawls each artist page to store painting URLs and attaches those names."
-    )
-
-    with st.expander("Loader settings", expanded=True):
-        user_agent = st.text_input("User-Agent", value=DEFAULT_UA, key="bl_ua")
-        timeout = st.slider("Timeout (sec)", 3, 30, int(DEFAULT_TIMEOUT), 1, key="bl_timeout")
-        crawl_delay = st.slider("Crawl delay (sec)", 0.0, 2.0, float(DEFAULT_DELAY), 0.05, key="bl_delay")
-
-        cA, cB, cC = st.columns(3)
-        with cA:
-            letters_per_run = st.slider("Letters per run (artists)", 1, 26, 6, 1, key="bl_letters")
-        with cB:
-            artists_per_run = st.slider("Artists per run (paintings)", 1, 500, 50, 1, key="bl_artists_per")
-        with cC:
-            cap_per_artist = st.slider("Cap paintings per artist (0 = no cap)", 0, 5000, 0, 50, key="bl_cap")
-
-        st.caption(f"DB path: {DB_PATH}")
-        st.caption(f"Cache dir: {CACHE_DIR}")
-
-    artists_json = ingest_state_get("artists_json", "[]")
     try:
-        artists_list = json.loads(artists_json)
-    except Exception:
-        artists_list = []
-    letter_pos = int(ingest_state_get("artist_letter_pos", "0") or "0")
-    artist_idx = int(ingest_state_get("artist_idx", "0") or "0")
+        st.subheader("Bulk Loader (Resumable)")
+        st.write(
+            "Step 1 loads artists from A..Z letter pages and stores artist **names**. "
+            "Step 2 crawls each artist page to store painting URLs and attaches those names."
+        )
 
-    st.info(
-        f"Artists loaded: **{len(artists_list)}** | Letter progress: **{letter_pos}/26** | "
-        f"Artist progress: **{artist_idx}/{len(artists_list) or 0}**"
-    )
+        with st.expander("Loader settings", expanded=True):
+            user_agent = st.text_input("User-Agent", value=DEFAULT_UA, key="bl_ua")
+            timeout = st.slider("Timeout (sec)", 3, 30, int(DEFAULT_TIMEOUT), 1, key="bl_timeout")
+            crawl_delay = st.slider("Crawl delay (sec)", 0.0, 2.0, float(DEFAULT_DELAY), 0.05, key="bl_delay")
 
-    c1, c2 = st.columns(2, gap="large")
+            cA, cB, cC = st.columns(3)
+            with cA:
+                letters_per_run = st.slider("Letters per run (artists)", 1, 26, 6, 1, key="bl_letters")
+            with cB:
+                artists_per_run = st.slider("Artists per run (paintings)", 1, 500, 50, 1, key="bl_artists_per")
+            with cC:
+                cap_per_artist = st.slider("Cap paintings per artist (0 = no cap)", 0, 5000, 0, 50, key="bl_cap")
 
-    with c1:
-        if st.button("1) Load artists (batch)", type="primary", use_container_width=True, key="bl_load_artists"):
-            added_urls, updated_names, status = load_all_artists_batch(
-                user_agent=user_agent,
-                timeout=float(timeout),
-                delay=float(crawl_delay),
-                letters_per_run=int(letters_per_run),
-            )
-            st.success(f"Added {added_urls} artist URLs; updated {updated_names} names. {status}")
+            st.caption(f"DB path: {DB_PATH}")
+            st.caption(f"Cache dir: {CACHE_DIR}")
+
+        artists_json = ingest_state_get("artists_json", "[]")
+        try:
+            artists_list = json.loads(artists_json)
+        except Exception:
+            artists_list = []
+        letter_pos = int(ingest_state_get("artist_letter_pos", "0") or "0")
+        artist_idx = int(ingest_state_get("artist_idx", "0") or "0")
+
+        st.info(
+            f"Artists loaded: **{len(artists_list)}** | Letter progress: **{letter_pos}/26** | "
+            f"Artist progress: **{artist_idx}/{len(artists_list) or 0}**"
+        )
+
+        c1, c2 = st.columns(2, gap="large")
+
+        with c1:
+            if st.button("1) Load artists (batch)", type="primary", use_container_width=True, key="bl_load_artists"):
+                added_urls, updated_names, status = load_all_artists_batch(
+                    user_agent=user_agent,
+                    timeout=float(timeout),
+                    delay=float(crawl_delay),
+                    letters_per_run=int(letters_per_run),
+                )
+                st.success(f"Added {added_urls} artist URLs; updated {updated_names} names. {status}")
+                st.rerun()
+
+            if st.button("Reset letter progress", use_container_width=True, key="bl_reset_letters"):
+                ingest_state_set("artist_letter_pos", "0")
+                st.warning("Reset letter progress to 0.")
+                st.rerun()
+
+        with c2:
+            if st.button("2) Load paintings (batch)", type="primary", use_container_width=True, key="bl_load_paintings"):
+                unique_inserts, artists_done, missing_names, status = load_all_paintings_batch(
+                    user_agent=user_agent,
+                    timeout=float(timeout),
+                    delay=float(crawl_delay),
+                    artists_per_run=int(artists_per_run),
+                    paintings_cap_per_artist=int(cap_per_artist),
+                )
+                st.success(
+                    f"Inserted {unique_inserts} new painting URLs from {artists_done} artists. "
+                    f"Missing names: {missing_names}. {status}"
+                )
+                st.session_state["queue_urls"] = build_session_queue(limit=int(queue_limit), seed=int(queue_seed))
+                st.session_state["queue_idx"] = 0
+                clear_current_pair()
+                st.rerun()
+
+            if st.button("Reset artist crawl index", use_container_width=True, key="bl_reset_artist_idx"):
+                ingest_state_set("artist_idx", "0")
+                st.warning("Reset artist crawl index to 0.")
+                st.rerun()
+
+        st.divider()
+        st.subheader("Optional: enrich a random sample (titles / img URLs)")
+        st.write("Fetches ONLY HTML for a sample of painting pages to improve metadata. Still no image downloads server-side.")
+
+        enrich_n = st.slider("Enrich N paintings now", 0, 200, 20, 5, key="bl_enrich_n")
+        if st.button("Enrich sample", use_container_width=True, key="bl_enrich_btn") and enrich_n > 0:
+            pool = get_pool(limit=max(500, enrich_n * 10))
+            rng = random.Random(int(queue_seed) ^ (now_ts() // 10))
+            rng.shuffle(pool)
+            sample = pool[:enrich_n]
+            prog = st.progress(0)
+            ok = 0
+            for i, p in enumerate(sample):
+                if ingest_painting_page_full(p["url"], user_agent, float(timeout), float(crawl_delay)):
+                    ok += 1
+                prog.progress(int(100 * (i + 1) / max(1, len(sample))))
+            st.success(f"Enriched {ok}/{len(sample)} paintings.")
             st.rerun()
 
-        if st.button("Reset letter progress", use_container_width=True, key="bl_reset_letters"):
-            ingest_state_set("artist_letter_pos", "0")
-            st.warning("Reset letter progress to 0.")
-            st.rerun()
-
-    with c2:
-        if st.button("2) Load paintings (batch)", type="primary", use_container_width=True, key="bl_load_paintings"):
-            unique_inserts, artists_done, missing_names, status = load_all_paintings_batch(
-                user_agent=user_agent,
-                timeout=float(timeout),
-                delay=float(crawl_delay),
-                artists_per_run=int(artists_per_run),
-                paintings_cap_per_artist=int(cap_per_artist),
-            )
-            st.success(
-                f"Inserted {unique_inserts} new painting URLs from {artists_done} artists. "
-                f"Missing names: {missing_names}. {status}"
-            )
-            st.session_state["queue_urls"] = build_session_queue(limit=int(queue_limit), seed=int(queue_seed))
-            st.session_state["queue_idx"] = 0
-            clear_current_pair()
-            st.rerun()
-
-        if st.button("Reset artist crawl index", use_container_width=True, key="bl_reset_artist_idx"):
-            ingest_state_set("artist_idx", "0")
-            st.warning("Reset artist crawl index to 0.")
-            st.rerun()
-
-    st.divider()
-    st.subheader("Optional: enrich a random sample (titles / img URLs)")
-    st.write("Fetches ONLY HTML for a sample of painting pages to improve metadata. Still no image downloads server-side.")
-
-    enrich_n = st.slider("Enrich N paintings now", 0, 200, 20, 5, key="bl_enrich_n")
-    if st.button("Enrich sample", use_container_width=True, key="bl_enrich_btn") and enrich_n > 0:
-        pool = get_pool(limit=max(500, enrich_n * 10))
-        rng = random.Random(int(queue_seed) ^ (now_ts() // 10))
-        rng.shuffle(pool)
-        sample = pool[:enrich_n]
-        prog = st.progress(0)
-        ok = 0
-        for i, p in enumerate(sample):
-            if ingest_painting_page_full(p["url"], user_agent, float(timeout), float(crawl_delay)):
-                ok += 1
-            prog.progress(int(100 * (i + 1) / max(1, len(sample))))
-        st.success(f"Enriched {ok}/{len(sample)} paintings.")
-        st.rerun()
+    except Exception as e:
+        st.error(f"Bulk Load tab error: {e}")
+        st.exception(e)
 
 
 # ----------------------------
 # Leaderboards tab
 # ----------------------------
 with tabs[2]:
-    st.subheader("Leaderboards (Live)")
+    try:
+        st.subheader("Leaderboards (Live)")
 
-    top_cols = st.columns(2)
-    with top_cols[0]:
-        top_p = st.slider("Top N paintings", 25, 1000, 200, 25, key="lb_top_paintings")
-    with top_cols[1]:
-        min_pg = st.slider("Min games per painting", 0, 50, 1, 1, key="lb_min_games_painting")
+        top_cols = st.columns(2)
+        with top_cols[0]:
+            top_p = st.slider("Top N paintings", 25, 1000, 200, 25, key="lb_top_paintings")
+        with top_cols[1]:
+            min_pg = st.slider("Min games per painting", 0, 50, 1, 1, key="lb_min_games_painting")
 
-    prow = paintings_leaderboard_live(limit=int(top_p), min_games=int(min_pg))
-    st.markdown("### 🏆 Top Paintings")
-    st.dataframe(prow, use_container_width=True, height=520)
+        prow = paintings_leaderboard_live(limit=int(top_p), min_games=int(min_pg))
+        st.markdown("### 🏆 Top Paintings")
+        st.dataframe(prow, use_container_width=True, height=520)
 
-    st.download_button(
-        "Download paintings leaderboard JSON",
-        data=json.dumps(prow, indent=2).encode("utf-8"),
-        file_name="artmash_paintings_leaderboard.json",
-        mime="application/json",
-        use_container_width=True,
-        key="lb_dl_paintings",
-    )
+        st.download_button(
+            "Download paintings leaderboard JSON",
+            data=json.dumps(prow, indent=2).encode("utf-8"),
+            file_name="artmash_paintings_leaderboard.json",
+            mime="application/json",
+            use_container_width=True,
+            key="lb_dl_paintings",
+        )
 
-    st.divider()
-    st.markdown("### 🎨 Top Artists (Canonical by artist URL)")
+        st.divider()
+        st.markdown("### 🎨 Top Artists (Canonical by artist URL)")
 
-    a1, a2, a3, a4 = st.columns(4)
-    with a1:
-        top_a = st.slider("Top N artists", 25, 1000, 200, 25, key="lb_top_artists")
-    with a2:
-        topk = st.slider("Aggregate top-k paintings", 1, 20, 5, 1, key="lb_topk")
-    with a3:
-        min_ag = st.slider("Min total games per artist", 0, 500, 5, 1, key="lb_min_artist_games")
-    with a4:
-        min_paint_games = st.slider("Min games per painting (artist agg)", 0, 50, 1, 1, key="lb_min_paint_games")
+        a1, a2, a3, a4 = st.columns(4)
+        with a1:
+            top_a = st.slider("Top N artists", 25, 1000, 200, 25, key="lb_top_artists")
+        with a2:
+            topk = st.slider("Aggregate top-k paintings", 1, 20, 5, 1, key="lb_topk")
+        with a3:
+            min_ag = st.slider("Min total games per artist", 0, 500, 5, 1, key="lb_min_artist_games")
+        with a4:
+            min_paint_games = st.slider("Min games per painting (artist agg)", 0, 50, 1, 1, key="lb_min_paint_games")
 
-    include_unknown = st.checkbox("Include Unknown artist bucket", value=False, key="lb_include_unknown")
+        include_unknown = st.checkbox("Include Unknown artist bucket", value=False, key="lb_include_unknown")
 
-    arow = artists_leaderboard_live(
-        limit=int(top_a),
-        topk=int(topk),
-        min_artist_games=int(min_ag),
-        min_painting_games=int(min_paint_games),
-        include_unknown=bool(include_unknown),
-    )
-    st.dataframe(arow, use_container_width=True, height=520)
+        arow = artists_leaderboard_live(
+            limit=int(top_a),
+            topk=int(topk),
+            min_artist_games=int(min_ag),
+            min_painting_games=int(min_paint_games),  # ✅ FIXED NAME
+            include_unknown=bool(include_unknown),
+        )
+        st.dataframe(arow, use_container_width=True, height=520)
 
-    st.download_button(
-        "Download artist leaderboard JSON",
-        data=json.dumps(arow, indent=2).encode("utf-8"),
-        file_name="artmash_artist_leaderboard.json",
-        mime="application/json",
-        use_container_width=True,
-        key="lb_dl_artists",
-    )
+        st.download_button(
+            "Download artist leaderboard JSON",
+            data=json.dumps(arow, indent=2).encode("utf-8"),
+            file_name="artmash_artist_leaderboard.json",
+            mime="application/json",
+            use_container_width=True,
+            key="lb_dl_artists",
+        )
+
+    except Exception as e:
+        st.error(f"Leaderboards tab error: {e}")
+        st.exception(e)
 
 st.caption("Tip: If images do not show in img-tag mode (hotlink restrictions), use iframe mode.")
