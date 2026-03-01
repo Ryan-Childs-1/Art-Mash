@@ -489,7 +489,8 @@ def get_pool(limit: int = 4000) -> List[Dict]:
         migrate_schema(conn)
         cur = conn.execute(
             """
-            SELECT url, img_url, title, artist, artist_id, meta, tags, elo, mu, sigma, games, wins, losses, last_seen, last_vote
+            SELECT url, img_url, title, artist, artist_id, meta, tags,
+                   elo, mu, sigma, games, wins, losses, last_seen, last_vote
             FROM paintings
             ORDER BY last_seen DESC
             LIMIT ?
@@ -507,8 +508,8 @@ def get_pool(limit: int = 4000) -> List[Dict]:
                 url=r[0],
                 img_url=r[1] or "",
                 title=r[2] or "",
-                artist=r[3] or "",
-                artist_id=r[4] or "",
+                artist=(r[3] or "").strip(),
+                artist_id=(r[4] or "").strip(),
                 meta=r[5] or "",
                 tags=json.loads(r[6]) if r[6] else [],
                 elo=float(r[7] or 1500.0),
@@ -522,7 +523,6 @@ def get_pool(limit: int = 4000) -> List[Dict]:
             )
         )
     return out
-
 
 def get_painting(url: str) -> Optional[Dict]:
     conn = db()
@@ -709,6 +709,140 @@ def apply_vote(winner_url: str, loser_url: str, mode: str = "vote"):
         conn.commit()
     finally:
         conn.close()
+
+
+def conservative_value(p: Dict) -> float:
+    """Primary ranking metric for both paintings + artists."""
+    return float(p["mu"]) - 3.0 * float(p["sigma"])
+
+
+def painting_rank_key(p: Dict) -> Tuple[float, int, int]:
+    """
+    Sort highest first by:
+    1) conservative value
+    2) games (more evidence)
+    3) last_vote recency
+    """
+    return (conservative_value(p), int(p.get("games", 0)), int(p.get("last_vote", 0)))
+
+
+def normalize_artist_key(p: Dict) -> Tuple[str, str]:
+    """
+    Avoid bad merges:
+    - Prefer numeric artist_id when present (storeroom)
+    - Fallback to artist name
+    Returns (primary_key, display_name)
+    """
+    aid = (p.get("artist_id") or "").strip()
+    name = (p.get("artist") or "").strip()
+
+    if aid:
+        display = name if name else f"Artist {aid}"
+        return (f"id:{aid}", display)
+
+    if name:
+        return (f"name:{name.lower()}", name)
+
+    # Unknown artist; keep separate buckets rather than merging all unknowns
+    # Use url hash prefix so unknowns don't all collapse into one
+    u = (p.get("url") or "")
+    return (f"unknown:{sha1(u)[:10]}", "Unknown artist")
+
+
+def paintings_leaderboard_live(pool: List[Dict], n: int, min_games: int = 0) -> List[Dict]:
+    """
+    Real-time top paintings by conservative TrueSkill value.
+    """
+    filtered = [p for p in pool if int(p.get("games", 0)) >= int(min_games)]
+    filtered.sort(key=painting_rank_key, reverse=True)
+
+    rows = []
+    for i, p in enumerate(filtered[:n], 1):
+        v = conservative_value(p)
+        rows.append({
+            "rank": i,
+            "score_0_100": round(value_score_0_100(v), 1),
+            "value": round(v, 4),
+            "mu": round(float(p["mu"]), 4),
+            "sigma": round(float(p["sigma"]), 4),
+            "games": int(p["games"]),
+            "wins": int(p["wins"]),
+            "losses": int(p["losses"]),
+            "artist": (p.get("artist") or ""),
+            "artist_id": (p.get("artist_id") or ""),
+            "title": (p.get("title") or ""),
+            "url": p["url"],
+        })
+    return rows
+
+
+def artists_leaderboard_live(
+    pool: List[Dict],
+    n: int,
+    topk: int = 5,
+    min_artist_games: int = 0,
+    min_painting_games: int = 0,
+) -> List[Dict]:
+    """
+    Real-time top artists.
+    We compute artist rating = average conservative value of their top-k eligible paintings.
+
+    Eligibility:
+    - painting games >= min_painting_games (prevents "0-vote" top ranks)
+    - artist total games >= min_artist_games (prevents artists with no data)
+    """
+    buckets: Dict[str, Dict] = {}
+
+    for p in pool:
+        if int(p.get("games", 0)) < int(min_painting_games):
+            continue
+
+        key, display = normalize_artist_key(p)
+        if key not in buckets:
+            buckets[key] = {"display": display, "paintings": [], "games_total": 0}
+        buckets[key]["paintings"].append(p)
+        buckets[key]["games_total"] += int(p.get("games", 0))
+
+    rows = []
+    for key, b in buckets.items():
+        if int(b["games_total"]) < int(min_artist_games):
+            continue
+
+        paintings_sorted = sorted(b["paintings"], key=painting_rank_key, reverse=True)
+        top = paintings_sorted[:max(1, int(topk))]
+
+        # Aggregate: avg of conservative values of top-k
+        vals = [conservative_value(p) for p in top]
+        artist_value = sum(vals) / max(1, len(vals))
+
+        # Some extra info: best painting
+        best = top[0] if top else None
+        rows.append({
+            "artist": b["display"],
+            "value": artist_value,
+            "score_0_100": value_score_0_100(artist_value),
+            "games": int(b["games_total"]),
+            "paintings": len(b["paintings"]),
+            "best_title": (best.get("title") if best else ""),
+            "best_url": (best.get("url") if best else ""),
+        })
+
+    # Sort descending by value, then games, then paintings count
+    rows.sort(key=lambda r: (float(r["value"]), int(r["games"]), int(r["paintings"])), reverse=True)
+
+    out = []
+    for i, r in enumerate(rows[:n], 1):
+        out.append({
+            "rank": i,
+            "artist": r["artist"],
+            "score_0_100": round(float(r["score_0_100"]), 1),
+            "value": round(float(r["value"]), 4),
+            "games": int(r["games"]),
+            "paintings": int(r["paintings"]),
+            "best_title": r["best_title"] or "",
+            "best_url": r["best_url"] or "",
+        })
+    return out
 
 
 # ----------------------------
@@ -1135,36 +1269,73 @@ with tabs[1]:
 # Leaderboards tab
 # ----------------------------
 with tabs[2]:
-    st.subheader("Leaderboards")
-    pool = get_pool(limit=20000)  # big enough for meaningful boards; adjust if needed
+    st.subheader("Leaderboards (Live)")
 
-    c1, c2 = st.columns(2, gap="large")
-    with c1:
-        st.markdown("### 🏆 Top Paintings")
-        topn = st.slider("Top N paintings", 25, 500, 100, 25)
-        rows = paintings_leaderboard(pool, n=int(topn))
-        st.dataframe(rows, use_container_width=True, height=520)
-        st.download_button(
-            "Download paintings leaderboard JSON",
-            data=json.dumps(rows, indent=2).encode("utf-8"),
-            file_name="artmash_paintings_leaderboard.json",
-            mime="application/json",
-            use_container_width=True,
-        )
+    # Real-time refresh toggle (forces rerun)
+    cA, cB, cC = st.columns([1, 1, 2])
+    with cA:
+        auto_refresh = st.checkbox("Auto-refresh (every vote)", value=True)
+    with cB:
+        if st.button("🔄 Refresh now", use_container_width=True):
+            st.rerun()
 
-    with c2:
-        st.markdown("### 🎨 Top Artists")
-        topk = st.slider("Artist aggregation top-k paintings", 1, 20, 5, 1)
-        topn_a = st.slider("Top N artists", 25, 500, 100, 25)
-        arows = artist_leaderboard(pool, topk=int(topk), n=int(topn_a))
-        st.dataframe(arows, use_container_width=True, height=520)
-        st.download_button(
-            "Download artist leaderboard JSON",
-            data=json.dumps(arows, indent=2).encode("utf-8"),
-            file_name="artmash_artist_leaderboard.json",
-            mime="application/json",
-            use_container_width=True,
-        )
+    # Always re-query from DB so this is genuinely "real-time"
+    # (No stale cached pool)
+    pool_limit = st.slider("Pool sample size for leaderboards", 1000, 50000, 20000, 1000)
+    pool = get_pool(limit=int(pool_limit))
+
+    st.caption(f"Using {len(pool)} paintings from DB for leaderboard computation.")
+
+    st.markdown("### 🏆 Top Paintings")
+    pcol1, pcol2 = st.columns(2)
+    with pcol1:
+        top_p = st.slider("Top N paintings", 25, 1000, 200, 25)
+    with pcol2:
+        min_pg = st.slider("Min games per painting", 0, 50, 1, 1)
+
+    prow = paintings_leaderboard_live(pool, n=int(top_p), min_games=int(min_pg))
+    st.dataframe(prow, use_container_width=True, height=520)
+    st.download_button(
+        "Download paintings leaderboard JSON",
+        data=json.dumps(prow, indent=2).encode("utf-8"),
+        file_name="artmash_paintings_leaderboard.json",
+        mime="application/json",
+        use_container_width=True,
+    )
+
+    st.divider()
+    st.markdown("### 🎨 Top Artists")
+    acol1, acol2, acol3 = st.columns(3)
+    with acol1:
+        top_a = st.slider("Top N artists", 25, 1000, 200, 25)
+    with acol2:
+        topk = st.slider("Aggregate top-k paintings per artist", 1, 20, 5, 1)
+    with acol3:
+        min_ag = st.slider("Min total games per artist", 0, 500, 5, 1)
+
+    min_paint_games = st.slider("Min games per painting (for artist agg)", 0, 50, 1, 1)
+
+    arow = artists_leaderboard_live(
+        pool,
+        n=int(top_a),
+        topk=int(topk),
+        min_artist_games=int(min_ag),
+        min_painting_games=int(min_paint_games),
+    )
+    st.dataframe(arow, use_container_width=True, height=520)
+    st.download_button(
+        "Download artist leaderboard JSON",
+        data=json.dumps(arow, indent=2).encode("utf-8"),
+        file_name="artmash_artist_leaderboard.json",
+        mime="application/json",
+        use_container_width=True,
+    )
+
+    # Optional: refresh immediately after a vote in this session
+    # (If you're already calling st.rerun() after vote, this will already be live)
+    if auto_refresh:
+        # no-op: the vote handler typically reruns; kept for clarity
+        pass
 
 
 # ----------------------------
