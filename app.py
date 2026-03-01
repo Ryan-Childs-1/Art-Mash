@@ -575,7 +575,7 @@ def get_pool(limit: int = 4000) -> List[Dict]:
             SELECT url, img_url, title, artist, artist_url, meta, tags,
                    elo, mu, sigma, games, wins, losses, last_seen, last_vote
             FROM paintings
-            ORDER BY last_seen DESC
+            items = sorted(b last_seen DESC
             LIMIT ?
             """,
             (limit,),
@@ -944,7 +944,7 @@ def paintings_leaderboard_live(limit: int, min_games: int) -> List[Dict]:
                    COALESCE(last_vote,0) AS last_vote
             FROM paintings
             WHERE COALESCE(games,0) >= ?
-            ORDER BY (COALESCE(mu, ?) - 3*COALESCE(sigma, ?)) DESC,
+            items = sorted(b (COALESCE(mu, ?) - 3*COALESCE(sigma, ?)) DESC,
                      COALESCE(games,0) DESC,
                      COALESCE(last_vote,0) DESC
             LIMIT ?
@@ -1031,11 +1031,12 @@ def artists_leaderboard_live(
     for b in buckets.values():
         if int(b["games_total"]) < int(min_artist_games):
             continue
-        items = sorted(b["items"], key=lambda t: (t[0], t[1]), reverse=True)
+        # Lowest value is best
+        items = sorted(b["items"], key=lambda t: (t[0], -t[1]))  # tie-break: more games preferred
         top = items[:max(1, int(topk))]
+        best = top[0] if top else None
         vals = [t[0] for t in top]
         score = sum(vals) / max(1, len(vals))
-        best = top[0] if top else None
         agg_rows.append({
             "artist": b["artist"],
             "artist_url": b["artist_url"],
@@ -1047,7 +1048,8 @@ def artists_leaderboard_live(
             "best_title": best[3] if best else "",
         })
 
-    agg_rows.sort(key=lambda r: (float(r["value"]), int(r["games"]), int(r["paintings"])), reverse=True)
+    # Lowest value is best; tie-break: more games/paintings preferred
+    agg_rows.sort(key=lambda r: (float(r["value"]), -int(r["games"]), -int(r["paintings"])))
     out = []
     for i, r in enumerate(agg_rows[:int(limit)], 1):
         out.append({
