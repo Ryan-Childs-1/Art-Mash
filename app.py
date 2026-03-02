@@ -4,8 +4,12 @@
 # Run:
 #   streamlit run app.py
 #
-# Optional DB path override:
-#   ARTMASH_DB_PATH=/path/to/artmash.sqlite3 streamlit run app.py
+# IMPORTANT (persistence / “never restart when you update”):
+# - All crawl progress + history is stored in the SQLite database (paintings/artists/votes + ingest_state).
+# - As long as the DB file persists across deployments, the crawler will continue where it left off.
+# - To guarantee persistence across updates, set ARTMASH_DB_PATH to a persistent location if available.
+#   Example:
+#     ARTMASH_DB_PATH=/path/to/persistent/artmash.sqlite3 streamlit run app.py
 
 import json
 import random
@@ -18,7 +22,7 @@ C.init_db()
 st.title("🖼️ Art Mash")
 st.caption(
     "Votes persist to SQLite and leaderboards update live after every vote. "
-    "Matchmaking: champion can stay up to 3 wins + periodic similar-rating ladder matches."
+    "Crawl history + progress are stored in the DB so the dataset keeps expanding over time."
 )
 
 with st.sidebar:
@@ -34,10 +38,32 @@ with st.sidebar:
     iframe_height = st.slider("Display height", 360, 900, 620, 10, key="sb_iframe_height")
     show_meta = st.checkbox("Show metadata", value=True, key="sb_show_meta")
 
+    st.divider()
+    st.header("Database")
+    st.caption("Crawl progress + vote history are stored here.")
+    st.code(getattr(C, "DB_PATH", "artmash.sqlite3"), language="text")
+
+    # Optional: allow user to back up the DB (useful on Streamlit Cloud before redeploy)
+    try:
+        db_path = getattr(C, "DB_PATH", None)
+        if db_path and isinstance(db_path, str):
+            with open(db_path, "rb") as f:
+                db_bytes = f.read()
+            st.download_button(
+                "⬇️ Download database backup",
+                data=db_bytes,
+                file_name="artmash.sqlite3",
+                mime="application/x-sqlite3",
+                use_container_width=True,
+            )
+    except Exception:
+        # If file isn't readable in the environment, just skip the backup button.
+        pass
+
 tabs = st.tabs(["Vote", "Bulk Load", "Leaderboards"])
 
 # ----------------------------
-# Session init
+# Session init (DO NOT reset crawl state)
 # ----------------------------
 ss = st.session_state
 
@@ -45,13 +71,14 @@ if rebuild_queue or "queue_urls" not in ss:
     ss["queue_urls"] = C.build_session_queue(limit=int(queue_limit), seed=int(queue_seed))
     ss["queue_idx"] = 0
 
-    # Reset advanced matchmaking state safely
+    # Reset only per-session matchup state (NOT crawl progress)
     if hasattr(C, "clear_current_pair"):
         C.clear_current_pair(ss)
     else:
         ss["current_pair_urls"] = ("", "")
         ss["current_pair_kind"] = "new"
 
+    # Matchmaking state (session-only)
     ss["champion_url"] = ""
     ss["champion_wins"] = 0
     ss["new_rounds_since_ladder"] = 0
@@ -70,7 +97,6 @@ DEFAULT_UA_LOCAL = C.DEFAULT_UA
 with tabs[0]:
     st.write(f"Session queue size: **{len(ss['queue_urls'])}**  |  Queue position: **{ss.get('queue_idx',0)}**")
 
-    # Advanced matchmaking (locks the pair internally in session_state)
     pair = C.pick_pair_advanced(ss)
 
     if not pair:
@@ -112,21 +138,16 @@ with tabs[0]:
         card(colL, left, "A")
         card(colR, right, "B")
 
-        # Use a form so only one action submits, and apply it to the locked pair.
         with st.form("vote_form", clear_on_submit=False):
             b1, b2, b3 = st.columns([1, 1, 1])
             vote_a = b1.form_submit_button("✅ Vote A", use_container_width=True)
             vote_b = b2.form_submit_button("✅ Vote B", use_container_width=True)
             skip = b3.form_submit_button("↩ Skip", use_container_width=True)
 
-        # Always use the LOCKED urls from core's matchmaking state
         lu, ru = ss.get("current_pair_urls", ("", ""))
         if not lu or not ru or lu == ru:
-            # If something went wrong with state, clear and rerun.
-            if hasattr(C, "clear_current_pair"):
-                C.clear_current_pair(ss)
-            else:
-                ss["current_pair_urls"] = ("", "")
+            # If state got out of sync, clear and rerun
+            C.clear_current_pair(ss)
             st.rerun()
 
         if vote_a:
@@ -142,18 +163,17 @@ with tabs[0]:
             st.rerun()
 
         if skip:
-            # Skip just advances to the next matchup (does not modify champion stats)
             C.clear_current_pair(ss)
             st.rerun()
 
 # ----------------------------
-# Bulk Load tab
+# Bulk Load tab (NO RESET BUTTONS)
 # ----------------------------
 with tabs[1]:
-    st.subheader("Bulk Loader (Resumable)")
+    st.subheader("Bulk Loader (Resumable + Persistent)")
     st.write(
-        "Step 1 loads artists from A..Z letter pages and stores artist **names**. "
-        "Step 2 crawls each artist page to store painting URLs and attaches those names."
+        "This loader is **resumable** and saves progress in the database (`ingest_state`). "
+        "It does **not** restart on reruns. It continues from the last saved position."
     )
 
     with st.expander("Loader settings", expanded=True):
@@ -169,11 +189,13 @@ with tabs[1]:
         with cC:
             cap_per_artist = st.slider("Cap paintings per artist (0 = no cap)", 0, 5000, 0, 50)
 
+    # Progress indicators are read from DB, not session state
     artists_json = C.ingest_state_get("artists_json", "[]")
     try:
         artists_list = json.loads(artists_json)
     except Exception:
         artists_list = []
+
     letter_pos = int(C.ingest_state_get("artist_letter_pos", "0") or "0")
     artist_idx = int(C.ingest_state_get("artist_idx", "0") or "0")
 
@@ -195,11 +217,6 @@ with tabs[1]:
             st.success(f"Added {added_urls} artist URLs; updated {updated_names} names. {status}")
             st.rerun()
 
-        if st.button("Reset letter progress", use_container_width=True):
-            C.ingest_state_set("artist_letter_pos", "0")
-            st.warning("Reset letter progress to 0.")
-            st.rerun()
-
     with c2:
         if st.button("2) Load paintings (batch)", type="primary", use_container_width=True):
             unique_inserts, artists_done, missing_names, status = C.load_all_paintings_batch(
@@ -214,16 +231,11 @@ with tabs[1]:
                 f"Missing names: {missing_names}. {status}"
             )
 
-            # Refresh queue and reset current matchup
+            # Refresh vote queue ONLY (do not touch ingest_state)
             ss["queue_urls"] = C.build_session_queue(limit=int(queue_limit), seed=int(queue_seed))
             ss["queue_idx"] = 0
             C.clear_current_pair(ss)
 
-            st.rerun()
-
-        if st.button("Reset artist crawl index", use_container_width=True):
-            C.ingest_state_set("artist_idx", "0")
-            st.warning("Reset artist crawl index to 0.")
             st.rerun()
 
     st.divider()
