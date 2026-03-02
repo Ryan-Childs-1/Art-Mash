@@ -39,6 +39,8 @@ tabs = st.tabs(["Vote", "Bulk Load", "Leaderboards"])
 if rebuild_queue or "queue_urls" not in st.session_state:
     st.session_state["queue_urls"] = C.build_session_queue(limit=int(queue_limit), seed=int(queue_seed))
     st.session_state["queue_idx"] = 0
+    # clear any locked pair so UI can't vote on a stale pair after a rebuild
+    st.session_state["current_pair_urls"] = None
 
 if "seen_urls" not in st.session_state:
     st.session_state["seen_urls"] = set()
@@ -51,19 +53,45 @@ DEFAULT_UA_LOCAL = C.DEFAULT_UA
 # Vote tab
 # ----------------------------
 with tabs[0]:
+    ss = st.session_state
+
     st.write(
-        f"Session queue size: **{len(st.session_state['queue_urls'])}**  |  Queue position: **{st.session_state.get('queue_idx',0)}**"
+        f"Session queue size: **{len(ss['queue_urls'])}**  |  Queue position: **{ss.get('queue_idx',0)}**"
     )
 
-    pair = C.pick_pair_from_queue(st.session_state)
+    # --- Pair locking ---
+    # Streamlit reruns the script on every button click. If we "pick a pair" on every run,
+    # the vote can be applied to a different pair than the one the user saw.
+    #
+    # Fix: lock the current pair in session_state and only advance it after a vote/skip.
+    if "current_pair_urls" not in ss:
+        ss["current_pair_urls"] = None  # Tuple[str,str] or None
+
+    def ensure_locked_pair():
+        if ss["current_pair_urls"] is None:
+            pair = C.pick_pair_from_queue(ss)  # advances queue_idx exactly once per new round
+            if not pair:
+                return None
+            left_p, right_p = pair
+            ss["current_pair_urls"] = (left_p["url"], right_p["url"])
+        lu, ru = ss["current_pair_urls"]
+        left_p = C.get_painting(lu)
+        right_p = C.get_painting(ru)
+        if not left_p or not right_p or lu == ru:
+            # If DB row disappeared, unlock and try again next run
+            ss["current_pair_urls"] = None
+            return None
+        return left_p, right_p
+
+    pair = ensure_locked_pair()
     if not pair:
         st.warning("Not enough paintings in the queue. Use Bulk Load to ingest more paintings, or increase queue size.")
     else:
         left, right = pair
-        st.session_state["seen_urls"].add(left["url"])
-        st.session_state["seen_urls"].add(right["url"])
+        ss["seen_urls"].add(left["url"])
+        ss["seen_urls"].add(right["url"])
 
-        # For img-tag mode, enrich missing img_url/title/artist lazily
+        # For img-tag mode, enrich missing img_url/title/artist lazily (but keep pair locked)
         if disp_mode_key == "img":
             if (not left.get("img_url")) or (not left.get("title")) or (not left.get("artist")):
                 C.ingest_painting_page_full(left["url"], DEFAULT_UA_LOCAL, DEFAULT_TIMEOUT, 0.0)
@@ -93,24 +121,34 @@ with tabs[0]:
         card(colL, left, "A")
         card(colR, right, "B")
 
-        b1, b2, b3 = st.columns([1, 1, 1])
-        vote_a = b1.button("✅ Vote A", use_container_width=True)
-        vote_b = b2.button("✅ Vote B", use_container_width=True)
-        skip = b3.button("↩ Skip", use_container_width=True)
+        # Use a form so only one action submits, and we can apply it to the locked pair.
+        with st.form("vote_form", clear_on_submit=False):
+            b1, b2, b3 = st.columns([1, 1, 1])
+            vote_a = b1.form_submit_button("✅ Vote A", use_container_width=True)
+            vote_b = b2.form_submit_button("✅ Vote B", use_container_width=True)
+            skip = b3.form_submit_button("↩ Skip", use_container_width=True)
+
+        # Apply actions using the LOCKED URLs (never the freshly rerun pair)
+        lu, ru = ss["current_pair_urls"]
 
         if vote_a:
-            C.record_vote(left["url"], right["url"], left["url"], mode="vote")
-            C.apply_vote(left["url"], right["url"])
+            C.record_vote(lu, ru, lu, mode="vote")
+            C.apply_vote(lu, ru)
+            ss["current_pair_urls"] = None
             st.rerun()
 
         if vote_b:
-            C.record_vote(left["url"], right["url"], right["url"], mode="vote")
-            C.apply_vote(right["url"], left["url"])
+            C.record_vote(lu, ru, ru, mode="vote")
+            C.apply_vote(ru, lu)
+            ss["current_pair_urls"] = None
             st.rerun()
 
         if skip:
+            ss["current_pair_urls"] = None
             st.rerun()
 
+# ----------------------------
+# Bulk Load tab
 # ----------------------------
 # Bulk Load tab
 # ----------------------------
@@ -178,6 +216,7 @@ with tabs[1]:
             )
             st.session_state["queue_urls"] = C.build_session_queue(limit=int(queue_limit), seed=int(queue_seed))
             st.session_state["queue_idx"] = 0
+            st.session_state["current_pair_urls"] = None
             st.rerun()
 
         if st.button("Reset artist crawl index", use_container_width=True):
