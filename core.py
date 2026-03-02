@@ -1152,8 +1152,11 @@ def render_painting_display(p: Dict, display_mode: str, height: int = 620):
 
 
 # ============================================================
-# Queue logic (session)
+# Queue logic (session) — ADVANCED MATCHMAKING
+#   - Champion stays up to 3 wins
+#   - Every 1–2 new rounds, inject a similar-rating ladder match
 # ============================================================
+
 def build_session_queue(limit: int, seed: int) -> List[str]:
     pool = get_pool(limit=limit)
     urls = [p["url"] for p in pool]
@@ -1172,7 +1175,235 @@ def next_from_queue(st_session_state) -> Optional[str]:
     return url
 
 
-def pick_pair_from_queue(st_session_state) -> Optional[Tuple[Dict, Dict]]:
+# ----------------------------
+# DB helpers for matchmaking
+# ----------------------------
+def painting_value(mu: float, sigma: float) -> float:
+    # conservative rating used everywhere else
+    return float(mu) - 3.0 * float(sigma)
+
+
+def _db_pick_newish_candidate(exclude_urls: set, prefer_games_leq: int = 0) -> Optional[str]:
+    """
+    "New painting" selection:
+    - Prefer paintings with games <= prefer_games_leq (default: 0)
+    - Fall back to low-games if needed.
+    """
+    conn = db()
+    try:
+        migrate_schema(conn)
+
+        # Prefer truly new (games=0), most recently seen first
+        cur = conn.execute(
+            """
+            SELECT url
+            FROM paintings
+            WHERE COALESCE(games,0) <= ?
+            ORDER BY COALESCE(last_seen,0) DESC
+            LIMIT 800
+            """,
+            (int(prefer_games_leq),),
+        )
+        candidates = [r[0] for r in cur.fetchall()]
+        for u in candidates:
+            if u and u not in exclude_urls:
+                return u
+
+        # Fall back: low-games pool
+        cur = conn.execute(
+            """
+            SELECT url
+            FROM paintings
+            ORDER BY COALESCE(games,0) ASC,
+                     COALESCE(last_vote,0) ASC,
+                     COALESCE(last_seen,0) DESC
+            LIMIT 1200
+            """
+        )
+        candidates = [r[0] for r in cur.fetchall()]
+        for u in candidates:
+            if u and u not in exclude_urls:
+                return u
+
+        return None
+    finally:
+        conn.close()
+
+
+def _db_pick_similar_rated_pair(
+    exclude_urls: set,
+    *,
+    min_games: int = 1,
+    window: float = 1.8,
+    sample_pool: int = 800,
+) -> Optional[Tuple[str, str]]:
+    """
+    Picks two previously-rated paintings of similar ranking.
+
+    Strategy:
+    - Choose a "seed" from recent-ish voted items (or any rated)
+    - Find a partner whose conservative value is within +/- window (or nearest by abs diff)
+    """
+    conn = db()
+    try:
+        migrate_schema(conn)
+
+        # Seed candidates: rated + recently voted
+        cur = conn.execute(
+            """
+            SELECT url, COALESCE(mu, ?), COALESCE(sigma, ?), COALESCE(games,0)
+            FROM paintings
+            WHERE COALESCE(games,0) >= ?
+            ORDER BY COALESCE(last_vote,0) DESC, COALESCE(games,0) DESC
+            LIMIT ?
+            """,
+            (TS_MU0, TS_SIGMA0, int(min_games), int(sample_pool)),
+        )
+        seeds = []
+        for url, mu, sigma, games in cur.fetchall():
+            if not url or url in exclude_urls:
+                continue
+            seeds.append((url, painting_value(mu, sigma)))
+
+        if not seeds:
+            return None
+
+        # Randomize seed a bit so it doesn't always pick the same head items
+        rng = random.Random(now_ts() ^ 0xA5A5)
+        seed_url, seed_v = rng.choice(seeds)
+
+        # Find nearest neighbor to seed by abs(value diff)
+        cur = conn.execute(
+            """
+            SELECT url, COALESCE(mu, ?), COALESCE(sigma, ?), COALESCE(games,0)
+            FROM paintings
+            WHERE COALESCE(games,0) >= ?
+              AND url != ?
+            """,
+            (TS_MU0, TS_SIGMA0, int(min_games), seed_url),
+        )
+
+        best = None
+        best_abs = None
+        for url, mu, sigma, games in cur.fetchall():
+            if not url or url in exclude_urls:
+                continue
+            v = painting_value(mu, sigma)
+            d = abs(v - seed_v)
+            # Prefer within window; otherwise keep best overall
+            if best is None:
+                best, best_abs = url, d
+            else:
+                # Strong preference for window matches
+                if d <= window and (best_abs is None or best_abs > window or d < best_abs):
+                    best, best_abs = url, d
+                elif (best_abs is not None and best_abs > window) and d < best_abs:
+                    best, best_abs = url, d
+
+        if not best:
+            return None
+
+        return (seed_url, best)
+    finally:
+        conn.close()
+
+
+# ----------------------------
+# State + pairing policy
+# ----------------------------
+def _ensure_matchmaking_state(st_session_state):
+    """
+    Initializes advanced matchmaking state for a session.
+    """
+    if "champion_url" not in st_session_state:
+        st_session_state["champion_url"] = ""  # current winner who stays on
+    if "champion_wins" not in st_session_state:
+        st_session_state["champion_wins"] = 0  # streak count
+    if "new_rounds_since_ladder" not in st_session_state:
+        st_session_state["new_rounds_since_ladder"] = 0
+    if "ladder_target_gap" not in st_session_state:
+        st_session_state["ladder_target_gap"] = random.choice([1, 2])  # every 1–2 new rounds
+    if "current_pair_urls" not in st_session_state:
+        st_session_state["current_pair_urls"] = ("", "")
+    if "current_pair_kind" not in st_session_state:
+        st_session_state["current_pair_kind"] = "new"  # "champion" | "ladder" | "new"
+
+
+def clear_current_pair(st_session_state):
+    st_session_state["current_pair_urls"] = ("", "")
+    st_session_state["current_pair_kind"] = "new"
+
+
+def pick_pair_advanced(st_session_state) -> Optional[Tuple[Dict, Dict]]:
+    """
+    Returns a stable pair (A,B) based on advanced matchmaking rules.
+    Also stores st_session_state["current_pair_urls"] and ["current_pair_kind"].
+
+    Pair types:
+      - "champion": champion stays, faces a new challenger (prefer games=0)
+      - "ladder": two similar-rated, previously-rated paintings
+      - "new": two fresh-ish paintings (fallback)
+    """
+    _ensure_matchmaking_state(st_session_state)
+
+    # If we already have a locked pair for the current render cycle, reuse it.
+    a_url, b_url = st_session_state.get("current_pair_urls", ("", ""))
+    if a_url and b_url:
+        A = get_painting(a_url)
+        B = get_painting(b_url)
+        if A and B:
+            return A, B
+        # if something vanished, clear lock and continue
+        clear_current_pair(st_session_state)
+
+    exclude = set(st_session_state.get("seen_urls", set()) or set())
+    champ = (st_session_state.get("champion_url") or "").strip()
+    champ_wins = int(st_session_state.get("champion_wins") or 0)
+
+    # Should we inject a ladder match now?
+    # "every one to two rounds of new paintings"
+    # We treat champion-vs-new as a "new round" (since challenger is new-ish).
+    new_since = int(st_session_state.get("new_rounds_since_ladder") or 0)
+    target_gap = int(st_session_state.get("ladder_target_gap") or 1)
+    do_ladder = (new_since >= target_gap)
+
+    if do_ladder:
+        pair = _db_pick_similar_rated_pair(exclude_urls=set(), min_games=1, window=1.8)
+        if pair:
+            u1, u2 = pair
+            A = get_painting(u1)
+            B = get_painting(u2)
+            if A and B and A["url"] != B["url"]:
+                st_session_state["current_pair_urls"] = (A["url"], B["url"])
+                st_session_state["current_pair_kind"] = "ladder"
+                # reset ladder timer
+                st_session_state["new_rounds_since_ladder"] = 0
+                st_session_state["ladder_target_gap"] = random.choice([1, 2])
+                return A, B
+        # If ladder fails, fall through to champion/new.
+
+    # Champion logic: keep winner up to 3 wins
+    if champ and champ_wins < 3:
+        A = get_painting(champ)
+        if A:
+            # pick a "newish" challenger (prefer games=0)
+            challenger_url = _db_pick_newish_candidate(exclude_urls={champ}, prefer_games_leq=0)
+            if not challenger_url:
+                # fallback: take next from queue
+                challenger_url = next_from_queue(st_session_state)
+
+            B = get_painting(challenger_url) if challenger_url else None
+            if B and B["url"] != A["url"]:
+                st_session_state["current_pair_urls"] = (A["url"], B["url"])
+                st_session_state["current_pair_kind"] = "champion"
+                # this is a "new painting round" because challenger is sourced from newish/low-games
+                st_session_state["new_rounds_since_ladder"] = new_since + 1
+                return A, B
+        # If champion missing, clear champion state
+        st_session_state["champion_url"] = ""
+        st_session_state["champion_wins"] = 0
+
+    # Otherwise: start fresh with two queue picks (fallback)
     a_url = next_from_queue(st_session_state)
     b_url = next_from_queue(st_session_state)
     if not a_url or not b_url or a_url == b_url:
@@ -1181,4 +1412,50 @@ def pick_pair_from_queue(st_session_state) -> Optional[Tuple[Dict, Dict]]:
     B = get_painting(b_url)
     if not A or not B:
         return None
+
+    st_session_state["current_pair_urls"] = (A["url"], B["url"])
+    st_session_state["current_pair_kind"] = "new"
+    st_session_state["new_rounds_since_ladder"] = new_since + 1
     return A, B
+
+
+def on_vote_advanced(st_session_state, winner_url: str, loser_url: str):
+    """
+    Call this AFTER record_vote() + apply_vote().
+    Updates champion / streak logic and clears the locked pair so next render gets a new matchup.
+    """
+    _ensure_matchmaking_state(st_session_state)
+
+    kind = st_session_state.get("current_pair_kind", "new")
+    champ = (st_session_state.get("champion_url") or "").strip()
+    champ_wins = int(st_session_state.get("champion_wins") or 0)
+
+    if kind == "champion":
+        # If the winner is the existing champion, streak++
+        if champ and winner_url == champ:
+            champ_wins += 1
+            st_session_state["champion_wins"] = champ_wins
+        else:
+            # Champion lost (or none) -> new champion begins
+            st_session_state["champion_url"] = winner_url
+            st_session_state["champion_wins"] = 1
+
+        # Retire champion after 3 wins
+        if int(st_session_state["champion_wins"]) >= 3:
+            st_session_state["champion_url"] = ""
+            st_session_state["champion_wins"] = 0
+
+    elif kind == "new":
+        # Optional: you can choose to "crown" the winner of a fresh match as champion.
+        # This makes the system feel more "king-of-the-hill" immediately.
+        st_session_state["champion_url"] = winner_url
+        st_session_state["champion_wins"] = 1
+
+    elif kind == "ladder":
+        # Ladder matches refine rankings; do not disturb champion unless none exists.
+        if not champ:
+            st_session_state["champion_url"] = winner_url
+            st_session_state["champion_wins"] = 1
+
+    # Always clear current pair lock after a decision
+    clear_current_pair(st_session_state)
