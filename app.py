@@ -9,16 +9,17 @@
 
 import json
 import random
-
 import streamlit as st
-
 import core as C
 
 st.set_page_config(page_title=C.APP_NAME, page_icon="🖼️", layout="wide")
 C.init_db()
 
 st.title("🖼️ Art Mash")
-st.caption("Votes persist to SQLite and leaderboards update live after every vote. Artist leaderboard is canonical by artist URL.")
+st.caption(
+    "Votes persist to SQLite and leaderboards update live after every vote. "
+    "Matchmaking: champion can stay up to 3 wins + periodic similar-rating ladder matches."
+)
 
 with st.sidebar:
     st.header("Queue")
@@ -35,15 +36,29 @@ with st.sidebar:
 
 tabs = st.tabs(["Vote", "Bulk Load", "Leaderboards"])
 
+# ----------------------------
 # Session init
-if rebuild_queue or "queue_urls" not in st.session_state:
-    st.session_state["queue_urls"] = C.build_session_queue(limit=int(queue_limit), seed=int(queue_seed))
-    st.session_state["queue_idx"] = 0
-    # clear any locked pair so UI can't vote on a stale pair after a rebuild
-    st.session_state["current_pair_urls"] = None
+# ----------------------------
+ss = st.session_state
 
-if "seen_urls" not in st.session_state:
-    st.session_state["seen_urls"] = set()
+if rebuild_queue or "queue_urls" not in ss:
+    ss["queue_urls"] = C.build_session_queue(limit=int(queue_limit), seed=int(queue_seed))
+    ss["queue_idx"] = 0
+
+    # Reset advanced matchmaking state safely
+    if hasattr(C, "clear_current_pair"):
+        C.clear_current_pair(ss)
+    else:
+        ss["current_pair_urls"] = ("", "")
+        ss["current_pair_kind"] = "new"
+
+    ss["champion_url"] = ""
+    ss["champion_wins"] = 0
+    ss["new_rounds_since_ladder"] = 0
+    ss["ladder_target_gap"] = random.choice([1, 2])
+
+if "seen_urls" not in ss:
+    ss["seen_urls"] = set()
 
 DEFAULT_TIMEOUT = 10.0
 DEFAULT_DELAY = 0.2
@@ -53,45 +68,19 @@ DEFAULT_UA_LOCAL = C.DEFAULT_UA
 # Vote tab
 # ----------------------------
 with tabs[0]:
-    ss = st.session_state
+    st.write(f"Session queue size: **{len(ss['queue_urls'])}**  |  Queue position: **{ss.get('queue_idx',0)}**")
 
-    st.write(
-        f"Session queue size: **{len(ss['queue_urls'])}**  |  Queue position: **{ss.get('queue_idx',0)}**"
-    )
+    # Advanced matchmaking (locks the pair internally in session_state)
+    pair = C.pick_pair_advanced(ss)
 
-    # --- Pair locking ---
-    # Streamlit reruns the script on every button click. If we "pick a pair" on every run,
-    # the vote can be applied to a different pair than the one the user saw.
-    #
-    # Fix: lock the current pair in session_state and only advance it after a vote/skip.
-    if "current_pair_urls" not in ss:
-        ss["current_pair_urls"] = None  # Tuple[str,str] or None
-
-    def ensure_locked_pair():
-        if ss["current_pair_urls"] is None:
-            pair = C.pick_pair_from_queue(ss)  # advances queue_idx exactly once per new round
-            if not pair:
-                return None
-            left_p, right_p = pair
-            ss["current_pair_urls"] = (left_p["url"], right_p["url"])
-        lu, ru = ss["current_pair_urls"]
-        left_p = C.get_painting(lu)
-        right_p = C.get_painting(ru)
-        if not left_p or not right_p or lu == ru:
-            # If DB row disappeared, unlock and try again next run
-            ss["current_pair_urls"] = None
-            return None
-        return left_p, right_p
-
-    pair = ensure_locked_pair()
     if not pair:
-        st.warning("Not enough paintings in the queue. Use Bulk Load to ingest more paintings, or increase queue size.")
+        st.warning("Not enough paintings available. Use Bulk Load to ingest more paintings, or increase queue size.")
     else:
         left, right = pair
         ss["seen_urls"].add(left["url"])
         ss["seen_urls"].add(right["url"])
 
-        # For img-tag mode, enrich missing img_url/title/artist lazily (but keep pair locked)
+        # For img-tag mode, enrich missing img_url/title/artist lazily (pair remains locked)
         if disp_mode_key == "img":
             if (not left.get("img_url")) or (not left.get("title")) or (not left.get("artist")):
                 C.ingest_painting_page_full(left["url"], DEFAULT_UA_LOCAL, DEFAULT_TIMEOUT, 0.0)
@@ -110,7 +99,9 @@ with tabs[0]:
                 if show_meta:
                     v = C.mu_sigma_to_value(p["mu"], p["sigma"])
                     st.markdown(
-                        f"**Score:** `{C.value_score_0_100(v):.1f}/100`  |  **μ/σ:** `{p['mu']:.2f}/{p['sigma']:.2f}`  |  **Games:** `{p['games']}`"
+                        f"**Score:** `{C.value_score_0_100(v):.1f}/100`  |  "
+                        f"**μ/σ:** `{p['mu']:.2f}/{p['sigma']:.2f}`  |  "
+                        f"**Games:** `{p['games']}`"
                     )
                     if p.get("title"):
                         st.markdown(f"**Title:** {p['title']}")
@@ -121,34 +112,40 @@ with tabs[0]:
         card(colL, left, "A")
         card(colR, right, "B")
 
-        # Use a form so only one action submits, and we can apply it to the locked pair.
+        # Use a form so only one action submits, and apply it to the locked pair.
         with st.form("vote_form", clear_on_submit=False):
             b1, b2, b3 = st.columns([1, 1, 1])
             vote_a = b1.form_submit_button("✅ Vote A", use_container_width=True)
             vote_b = b2.form_submit_button("✅ Vote B", use_container_width=True)
             skip = b3.form_submit_button("↩ Skip", use_container_width=True)
 
-        # Apply actions using the LOCKED URLs (never the freshly rerun pair)
-        lu, ru = ss["current_pair_urls"]
+        # Always use the LOCKED urls from core's matchmaking state
+        lu, ru = ss.get("current_pair_urls", ("", ""))
+        if not lu or not ru or lu == ru:
+            # If something went wrong with state, clear and rerun.
+            if hasattr(C, "clear_current_pair"):
+                C.clear_current_pair(ss)
+            else:
+                ss["current_pair_urls"] = ("", "")
+            st.rerun()
 
         if vote_a:
             C.record_vote(lu, ru, lu, mode="vote")
             C.apply_vote(lu, ru)
-            ss["current_pair_urls"] = None
+            C.on_vote_advanced(ss, winner_url=lu, loser_url=ru)
             st.rerun()
 
         if vote_b:
             C.record_vote(lu, ru, ru, mode="vote")
             C.apply_vote(ru, lu)
-            ss["current_pair_urls"] = None
+            C.on_vote_advanced(ss, winner_url=ru, loser_url=lu)
             st.rerun()
 
         if skip:
-            ss["current_pair_urls"] = None
+            # Skip just advances to the next matchup (does not modify champion stats)
+            C.clear_current_pair(ss)
             st.rerun()
 
-# ----------------------------
-# Bulk Load tab
 # ----------------------------
 # Bulk Load tab
 # ----------------------------
@@ -181,7 +178,8 @@ with tabs[1]:
     artist_idx = int(C.ingest_state_get("artist_idx", "0") or "0")
 
     st.info(
-        f"Artists loaded: **{len(artists_list)}** | Letter progress: **{letter_pos}/26** | Artist progress: **{artist_idx}/{len(artists_list) or 0}**"
+        f"Artists loaded: **{len(artists_list)}** | Letter progress: **{letter_pos}/26** | "
+        f"Artist progress: **{artist_idx}/{len(artists_list) or 0}**"
     )
 
     c1, c2 = st.columns(2, gap="large")
@@ -212,11 +210,15 @@ with tabs[1]:
                 paintings_cap_per_artist=int(cap_per_artist),
             )
             st.success(
-                f"Inserted {unique_inserts} new painting URLs from {artists_done} artists. Missing names: {missing_names}. {status}"
+                f"Inserted {unique_inserts} new painting URLs from {artists_done} artists. "
+                f"Missing names: {missing_names}. {status}"
             )
-            st.session_state["queue_urls"] = C.build_session_queue(limit=int(queue_limit), seed=int(queue_seed))
-            st.session_state["queue_idx"] = 0
-            st.session_state["current_pair_urls"] = None
+
+            # Refresh queue and reset current matchup
+            ss["queue_urls"] = C.build_session_queue(limit=int(queue_limit), seed=int(queue_seed))
+            ss["queue_idx"] = 0
+            C.clear_current_pair(ss)
+
             st.rerun()
 
         if st.button("Reset artist crawl index", use_container_width=True):
@@ -240,6 +242,7 @@ with tabs[1]:
                 ok += 1
             prog.progress(int(100 * (i + 1) / max(1, len(sample))))
         st.success(f"Enriched {ok}/{len(sample)} paintings.")
+        C.clear_current_pair(ss)
         st.rerun()
 
 # ----------------------------
@@ -247,7 +250,7 @@ with tabs[1]:
 # ----------------------------
 with tabs[2]:
     st.subheader("Leaderboards (Live)")
-    st.caption("Sorting: **lowest numbers are best**.")
+    st.caption("Sorting: **higher numbers are better**.")
 
     top_cols = st.columns(2)
     with top_cols[0]:
@@ -256,7 +259,7 @@ with tabs[2]:
         min_pg = st.slider("Min games per painting", 0, 50, 1, 1)
 
     prow = C.paintings_leaderboard_live(limit=int(top_p), min_games=int(min_pg))
-    st.markdown("### 🏆 Paintings (Lowest is Best)")
+    st.markdown("### 🏆 Paintings (Highest is Best)")
     st.dataframe(prow, use_container_width=True, height=520)
 
     st.download_button(
@@ -268,7 +271,7 @@ with tabs[2]:
     )
 
     st.divider()
-    st.markdown("### 🎨 Artists (Canonical by artist URL, Lowest is Best)")
+    st.markdown("### 🎨 Artists (Canonical by artist URL, Highest is Best)")
     a1, a2, a3, a4 = st.columns(4)
     with a1:
         top_a = st.slider("Top N artists", 25, 1000, 200, 25)
