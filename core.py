@@ -1002,7 +1002,7 @@ def paintings_leaderboard_live(limit: int, min_games: int) -> List[Dict]:
                    COALESCE(last_vote,0) AS last_vote
             FROM paintings
             WHERE COALESCE(games,0) >= ?
-            ORDER BY (COALESCE(mu, ?) - 3*COALESCE(sigma, ?)) ASC,
+            ORDER BY (COALESCE(mu, ?) - 3*COALESCE(sigma, ?)) DESC,
                      COALESCE(games,0) DESC,
                      COALESCE(last_vote,0) DESC
             LIMIT ?
@@ -1089,7 +1089,7 @@ def artists_leaderboard_live(
         if int(b["games_total"]) < int(min_artist_games):
             continue
 
-        items = sorted(b["items"], key=lambda t: (t[0], -t[1]))
+        items = sorted(b["items"], key=lambda t: (t[0], -t[1]), reverse=True)
         top = items[: max(1, int(topk))]
         best = top[0] if top else None
 
