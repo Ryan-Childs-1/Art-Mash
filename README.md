@@ -1,14 +1,21 @@
-# Art Mash (Streamlit)
+# Art Mash (Flat Folder)
 
-A FaceMash-style voting app for historical art from Gallerix storeroom.
+This version runs entirely from a **single folder** (no subpackages).
 
-## Run locally
+## Run
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
 ```
 
+## Database location
+By default the app uses `artmash.sqlite3` in the working directory (if writable).
+Override with:
+
+```bash
+ARTMASH_DB_PATH=/absolute/path/to/artmash.sqlite3 streamlit run app.py
+```
+
 ## Notes
-- Uses `artmash.sqlite3` in the project folder by default. On Streamlit Cloud, it will fall back to `/tmp/artmash.sqlite3` if the filesystem is read-only.
-- No server-side image downloading: uses iframe mode (most reliable) or browser-side `<img>` tag when metadata is available.
-- Bulk loading is resumable (run small batches to avoid timeouts).
+- Crawling fetches **HTML only** and caches it under `.cache_artmash/`.
+- Leaderboards are computed live from SQLite after every vote.
