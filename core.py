@@ -1109,7 +1109,10 @@ def artists_leaderboard_live(
             }
         )
 
-    agg_rows.sort(key=lambda r: (float(r["value"]), -int(r["games"]), -int(r["paintings"])))
+    agg_rows.sort(
+            key=lambda r: (float(r["value"]), int(r["games"]), int(r["paintings"])),
+            reverse=True
+        )
 
     out = []
     for i, r in enumerate(agg_rows[: int(limit)], 1):
